@@ -1,1 +1,1 @@
-# seekr-paper-tracker
+Seekr tracker deployment
