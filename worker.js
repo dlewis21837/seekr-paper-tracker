@@ -1,7 +1,7 @@
 const CHANNEL = "SeekrTrending";
 const MAX_MC = 3_000_000;
 const MIN_LIQ = 10_000;
-const MIN_SCORE = 4;
+const MIN_SCORE = 8;
 
 export default {
   async fetch(request, env) {
