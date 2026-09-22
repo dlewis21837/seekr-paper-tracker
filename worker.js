@@ -283,4 +283,4 @@ function usd(value) { return Number.isFinite(value) ? `$${Math.round(value).toLo
 function esc(value) { return String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
 function parseJsonArray(value) { try { const v = JSON.parse(value || "[]"); return Array.isArray(v) ? v : []; } catch { return []; } }
 async function check(response) { if (!response.ok) throw new Error(`HTTP ${response.status}`); return response; }
-    c
+    
