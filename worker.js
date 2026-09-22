@@ -248,8 +248,8 @@ const trojan = `https://t.me/${TROJAN_BOT}?start=r-${TROJAN_REF_CODE}-${call.con
     `1h volume: ${usd(r.volumeH1)}`,
     `1h change: ${r.changeH1.toFixed(1)}%`,
     `1h buys/sells: ${r.buys}/${r.sells}`,
-    `Why: ${esc(r.reasons.join(", "))}`,
-    `CA: <a href="${link}">${call.contract}</a>`,
+    `Why: ${esc(r.reasons.join(", "))}`,`CA: <a href="${link}">${call.contract}</a>`,
+`⚡ <a href="${trojan}">Buy on Trojan</a>`,
     "⚠️ Preliminary alert only—verify holders, insiders, bundlers and socials before risking money.",
   ].join("\n");
 }
