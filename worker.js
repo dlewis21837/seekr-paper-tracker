@@ -238,7 +238,7 @@ function scorePair(call, pair) {
 
 function formatAlert(call, pair, r) {
   const link = pair?.url || `https://dexscreener.com/solana/${call.contract}`;
-const trojan = `https://t.me/${TROJAN_BOT}?start=r-${TROJAN_REF_CODE}-${call.contract}`;
+
   const source = call.source === "RAYDIUM" ? "RAYDIUM" : "SEEKR";
   return [
     `🚨 <b>${source} CANDIDATE — ${esc(call.name)}</b>`,
