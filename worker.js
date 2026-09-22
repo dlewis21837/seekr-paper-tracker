@@ -1,7 +1,7 @@
 const CHANNEL = "SeekrTrending";
 const MAX_MARKET_CAP = 3_000_000;
 const MIN_LIQUIDITY = 10_000;
-const MIN_SCORE = 7;
+const MIN_SCORE = 4;
 
 const RAYDIUM_POOLS_URL = "https://api-v3.raydium.io/pools/info/list?poolType=all&poolSortField=default&sortType=desc&pageSize=100&page=1";
 const SOL_MINT = "So11111111111111111111111111111111111111112";
