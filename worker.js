@@ -2,6 +2,12 @@ const CHANNEL = "SeekrTrending";
 const MAX_MARKET_CAP = 3_000_000;
 const MIN_LIQUIDITY = 10_000;
 const MIN_SCORE = 1;
+const FINAL_CONFIRM_DELAY_MS = 8_000;
+const MAX_5M_DROP_PCT = -15;
+const MAX_1H_DROP_PCT = -30;
+const MIN_BUY_SELL_RATIO = 0.8;
+const MAX_CONFIRM_PRICE_DROP_PCT = 12;
+const MAX_CONFIRM_LIQUIDITY_DROP_PCT = 20;
 const ROBINHOOD_MIN_SCORE = 4;
 const BNB_MIN_SCORE = 4;
 const MAX_SINGLE_HOLDER_PCT = 15;
@@ -108,13 +114,14 @@ async function scan(env) {
   for (const call of fresh) {
     try {
       const pair = await getBestPair(call.contract);
-      const review = scorePair(call, pair);
+      const confirmation = await confirmMarketMomentum(call, pair);
+      const review = confirmation.review;
       const safety = await getSolanaSafety(call.contract);
-      if (safety.passed && passesMarketSafety(review) && review.score >= MIN_SCORE && review.marketCap <= MAX_MARKET_CAP) {
-        await sendTelegram(env, formatAlert(call, pair, { ...review, safety }));
+      if (safety.passed && confirmation.passed && review.score >= MIN_SCORE && review.marketCap <= MAX_MARKET_CAP) {
+        await sendTelegram(env, formatAlert(call, confirmation.pair, { ...review, safety }));
         results.push({ contract: call.contract, alerted: true, score: review.score, safety: safety.summary });
       } else {
-        results.push({ contract: call.contract, alerted: false, score: review.score, safety: safety.summary });
+        results.push({ contract: call.contract, alerted: false, score: review.score, safety: safety.summary, marketGate: confirmation.summary });
       }
     } catch (error) {
       results.push({ contract: call.contract, error: String(error) });
@@ -159,13 +166,14 @@ async function scanBnb(env) {
         const pair = pairs.get(key) || null;
         const safety = safeties.get(key) || { passed: false, summary: "GoPlus data unavailable" };
         const call = { ...item, name: item.name || pair?.baseToken?.name || pair?.baseToken?.symbol || "BNB token", paid: false, source: "BNB" };
-        const review = scorePair(call, pair, "BNB Chain");
-        if (pair && safety.passed && passesMarketSafety(review) && review.score >= BNB_MIN_SCORE && review.marketCap <= MAX_MARKET_CAP) {
-          await sendTelegram(env, formatAlert(call, pair, { ...review, safety }));
+        const confirmation = await confirmMarketMomentum(call, pair, { chainId: BNB_CHAIN_ID, chainName: "BNB Chain" });
+        const review = confirmation.review;
+        if (pair && safety.passed && confirmation.passed && review.score >= BNB_MIN_SCORE && review.marketCap <= MAX_MARKET_CAP) {
+          await sendTelegram(env, formatAlert(call, confirmation.pair, { ...review, safety }));
           savedAlerted.add(key);
           watch.delete(key);
           results.push({ contract: item.contract, alerted: true, score: review.score, safety: safety.summary });
-        } else results.push({ contract: item.contract, alerted: false, score: review.score, safety: safety.summary });
+        } else results.push({ contract: item.contract, alerted: false, score: review.score, safety: safety.summary, marketGate: confirmation.summary });
       } catch (error) {
         results.push({ contract: item.contract, error: String(error) });
       }
@@ -292,14 +300,15 @@ async function scanRobinhood(env) {
       try {
         const pair = await getBestPair(item.contract, null, ROBINHOOD_CHAIN_ID);
         const call = { ...item, name: pair?.baseToken?.name || pair?.baseToken?.symbol || "Robinhood token", paid: false, source: "ROBINHOOD" };
-        const review = scorePair(call, pair, "Robinhood Chain");
-        if (pair && passesMarketSafety(review) && review.score >= ROBINHOOD_MIN_SCORE && review.marketCap <= MAX_MARKET_CAP) {
-          await sendTelegram(env, formatAlert(call, pair, review));
+        const confirmation = await confirmMarketMomentum(call, pair, { chainId: ROBINHOOD_CHAIN_ID, chainName: "Robinhood Chain" });
+        const review = confirmation.review;
+        if (pair && confirmation.passed && review.score >= ROBINHOOD_MIN_SCORE && review.marketCap <= MAX_MARKET_CAP) {
+          await sendTelegram(env, formatAlert(call, confirmation.pair, review));
           savedAlerted.add(key);
           watch.delete(key);
           results.push({ contract: item.contract, alerted: true, score: review.score });
         } else {
-          results.push({ contract: item.contract, alerted: false, score: review.score });
+          results.push({ contract: item.contract, alerted: false, score: review.score, marketGate: confirmation.summary });
         }
       } catch (error) {
         results.push({ contract: item.contract, error: String(error) });
@@ -398,13 +407,14 @@ async function scanRaydium(env) {
     for (const call of fresh) {
       try {
         const pair = await getBestPair(call.contract, "raydium");
-        const review = scorePair(call, pair);
+        const confirmation = await confirmMarketMomentum(call, pair, { dexId: "raydium" });
+        const review = confirmation.review;
         const safety = await getSolanaSafety(call.contract);
-        if (pair && safety.passed && passesMarketSafety(review) && review.score >= MIN_SCORE && review.marketCap <= MAX_MARKET_CAP) {
-          await sendTelegram(env, formatAlert(call, pair, { ...review, safety }));
+        if (pair && safety.passed && confirmation.passed && review.score >= MIN_SCORE && review.marketCap <= MAX_MARKET_CAP) {
+          await sendTelegram(env, formatAlert(call, confirmation.pair, { ...review, safety }));
           results.push({ contract: call.contract, alerted: true, score: review.score, safety: safety.summary });
         } else {
-          results.push({ contract: call.contract, alerted: false, score: review.score, safety: safety.summary });
+          results.push({ contract: call.contract, alerted: false, score: review.score, safety: safety.summary, marketGate: confirmation.summary });
         }
       } catch (error) {
         results.push({ contract: call.contract, error: String(error) });
@@ -528,7 +538,39 @@ function reviewSolanaSafety(data) {
 function passesMarketSafety(review) {
   if (!review || !Number.isFinite(review.marketCap) || review.marketCap <= 0) return false;
   if (review.liquidity < MIN_LIQUIDITY) return false;
-  return review.liquidity / review.marketCap >= 0.01;
+  if (review.liquidity / review.marketCap < 0.01) return false;
+  if (review.changeM5 < MAX_5M_DROP_PCT || review.changeH1 < MAX_1H_DROP_PCT) return false;
+  if (review.sells > 0 && review.buys / review.sells < MIN_BUY_SELL_RATIO) return false;
+  return true;
+}
+
+async function confirmMarketMomentum(call, initialPair, options = {}) {
+  const chainId = options.chainId || "solana";
+  const chainName = options.chainName || "Solana";
+  const initialReview = scorePair(call, initialPair, chainName);
+  if (!passesMarketSafety(initialReview)) {
+    return { passed: false, pair: initialPair, review: initialReview, summary: "blocked by initial momentum gate" };
+  }
+
+  // A candidate must remain healthy across two observations before Telegram receives it.
+  await new Promise((resolve) => setTimeout(resolve, FINAL_CONFIRM_DELAY_MS));
+  const freshPair = await getBestPair(call.contract, options.dexId || null, chainId);
+  const freshReview = scorePair(call, freshPair, chainName);
+  if (!passesMarketSafety(freshReview)) {
+    return { passed: false, pair: freshPair, review: freshReview, summary: "blocked by final momentum gate" };
+  }
+
+  const initialPrice = num(initialPair?.priceUsd);
+  const freshPrice = num(freshPair?.priceUsd);
+  const priceDropPct = initialPrice > 0 ? ((initialPrice - freshPrice) / initialPrice) * 100 : 0;
+  const liquidityDropPct = initialReview.liquidity > 0
+    ? ((initialReview.liquidity - freshReview.liquidity) / initialReview.liquidity) * 100
+    : 0;
+  if (priceDropPct > MAX_CONFIRM_PRICE_DROP_PCT || liquidityDropPct > MAX_CONFIRM_LIQUIDITY_DROP_PCT) {
+    return { passed: false, pair: freshPair, review: freshReview, summary: "blocked: price or liquidity deteriorated during confirmation" };
+  }
+
+  return { passed: true, pair: freshPair, review: freshReview, summary: "passed two-observation momentum confirmation" };
 }
 
 function scorePair(call, pair, chainName = "Solana") {
@@ -536,6 +578,7 @@ function scorePair(call, pair, chainName = "Solana") {
   const marketCap = num(pair.marketCap || pair.fdv);
   const liquidity = num(pair.liquidity?.usd);
   const volumeH1 = num(pair.volume?.h1);
+  const changeM5 = num(pair.priceChange?.m5);
   const changeH1 = num(pair.priceChange?.h1);
   const buys = num(pair.txns?.h1?.buys);
   const sells = num(pair.txns?.h1?.sells);
@@ -553,7 +596,7 @@ function scorePair(call, pair, chainName = "Solana") {
   if (ageMinutes <= 180) { score += 1; reasons.push("very young pool"); }
   if (liquidity < MIN_LIQUIDITY) { score -= 3; reasons.push("thin liquidity"); }
   if (call.paid) { score -= 1; reasons.push("DexScreener promotion flagged"); }
-  return { score, marketCap, liquidity, volumeH1, changeH1, buys, sells, ageMinutes, reasons };
+  return { score, marketCap, liquidity, volumeH1, changeM5, changeH1, buys, sells, ageMinutes, reasons };
 }
 
 function formatAlert(call, pair, r) {
