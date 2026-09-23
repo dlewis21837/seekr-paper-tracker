@@ -142,10 +142,16 @@ async function scanBnb(env) {
     }
     const results = [];
     const candidates = [...watch.values()].slice(0, 20);
+    const contracts = candidates.map((item) => item.contract);
+    const [pairs, safeties] = await Promise.all([
+      getBestPairs(contracts, BNB_CHAIN_ID),
+      getBnbSafeties(contracts),
+    ]);
     for (const item of candidates) {
       const key = item.contract.toLowerCase();
       try {
-        const [pair, safety] = await Promise.all([getBestPair(item.contract, null, BNB_CHAIN_ID), getBnbSafety(item.contract)]);
+        const pair = pairs.get(key) || null;
+        const safety = safeties.get(key) || { passed: false, summary: "GoPlus data unavailable" };
         const call = { ...item, name: item.name || pair?.baseToken?.name || pair?.baseToken?.symbol || "BNB token", paid: false, source: "BNB" };
         const review = scorePair(call, pair, "BNB Chain");
         if (pair && safety.passed && review.score >= BNB_MIN_SCORE && review.marketCap <= MAX_MARKET_CAP) {
@@ -215,10 +221,24 @@ async function getBnbLaunches(token) {
 }
 
 async function getBnbSafety(contract) {
-  const url = `https://api.gopluslabs.io/api/v1/token_security/56?contract_addresses=${encodeURIComponent(contract)}`;
+  return (await getBnbSafeties([contract])).get(contract.toLowerCase()) || { passed: false, summary: "GoPlus data unavailable" };
+}
+
+async function getBnbSafeties(contracts) {
+  const results = new Map();
+  if (!contracts.length) return results;
+  const url = `https://api.gopluslabs.io/api/v1/token_security/56?contract_addresses=${encodeURIComponent(contracts.join(","))}`;
   const response = await fetch(url, { headers: { "User-Agent": "SeekrBnbTracker/1.0" } });
   const payload = await check(response).then((r) => r.json());
-  const data = payload?.result?.[contract.toLowerCase()];
+  for (const contract of contracts) {
+    const key = contract.toLowerCase();
+    const data = payload?.result?.[key];
+    results.set(key, reviewBnbSafety(data));
+  }
+  return results;
+}
+
+function reviewBnbSafety(data) {
   if (!data) return { passed: false, summary: "GoPlus data unavailable" };
   const buyTax = taxPercent(data.buy_tax);
   const sellTax = taxPercent(data.sell_tax);
@@ -429,6 +449,23 @@ async function getBestPair(contract, dexId = null, chainId = "solana") {
     p.chainId === chainId && (!dexId || String(p.dexId).toLowerCase().includes(dexId))
   );
   return pairs.sort((a, b) => num(b.liquidity?.usd) - num(a.liquidity?.usd))[0] || null;
+}
+
+async function getBestPairs(contracts, chainId) {
+  const best = new Map();
+  if (!contracts.length) return best;
+  const response = await fetch(`https://api.dexscreener.com/tokens/v1/${chainId}/${contracts.join(",")}`);
+  const pairs = await check(response).then((r) => r.json());
+  const wanted = new Set(contracts.map((address) => address.toLowerCase()));
+  for (const pair of Array.isArray(pairs) ? pairs : []) {
+    for (const address of [pair?.baseToken?.address, pair?.quoteToken?.address]) {
+      const key = String(address || "").toLowerCase();
+      if (!wanted.has(key)) continue;
+      const current = best.get(key);
+      if (!current || num(pair?.liquidity?.usd) > num(current?.liquidity?.usd)) best.set(key, pair);
+    }
+  }
+  return best;
 }
 
 function scorePair(call, pair, chainName = "Solana") {
