@@ -1,6 +1,6 @@
 {
   "name": "seekr-paper-tracker",
-  "main": "Seekr.js",
+  "main": "worker.js",
   "compatibility_date": "2026-09-20",
   "triggers": {
     "crons": ["*/3 * * * *"]
