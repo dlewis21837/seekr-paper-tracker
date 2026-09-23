@@ -2,6 +2,14 @@ const CHANNEL = "SeekrTrending";
 const MAX_MARKET_CAP = 3_000_000;
 const MIN_LIQUIDITY = 10_000;
 const MIN_SCORE = 1;
+const ROBINHOOD_MIN_SCORE = 4;
+
+const BITQUERY_URL = "https://streaming.bitquery.io/graphql";
+const ROBINHOOD_CHAIN_ID = "robinhood";
+const ROBINHOOD_ENTRY_CONTRACTS = [
+  "0x0000ffffbe8efe702c8703ae3477ff5de3d319c0",
+  "0x00004c4ccc709ef590f7c81102c0689f0263d4e9",
+];
 
 const RAYDIUM_POOLS_URL = "https://api-v3.raydium.io/pools/info/list?poolType=all&poolSortField=default&sortType=desc&pageSize=100&page=1";
 const SOL_MINT = "So11111111111111111111111111111111111111112";
@@ -18,9 +26,10 @@ export default {
       return Response.json(result);
     }
     return Response.json({
-      status: "Seekr tracker online",
+      status: "Seekr + Raydium + Robinhood Chain tracker online",
       schedule: "Every 3 minutes, 5:00 a.m.–8:00 p.m. Pacific",
       configured: Boolean(env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID && env.STATE),
+      robinhoodConfigured: Boolean(env.BITQUERY_TOKEN),
     });
   },
 
@@ -104,10 +113,102 @@ async function scan(env) {
 
   if (newestId > lastId) await statePut(env, newestId);
   const raydium = await scanRaydium(env);
+  const robinhood = await scanRobinhood(env);
   if (connected) {
-    await sendTelegram(env, "✅ Seekr + Raydium tracker connected. Scanning every 3 minutes from 5:00 a.m. to 8:00 p.m. Pacific.");
+    await sendTelegram(env, "✅ Seekr + Raydium + Robinhood Chain tracker connected. Scanning every 3 minutes from 5:00 a.m. to 8:00 p.m. Pacific.");
   }
-  return { ok: true, seekrChecked: fresh.length, seekrResults: results, raydium };
+  return { ok: true, seekrChecked: fresh.length, seekrResults: results, raydium, robinhood };
+}
+
+async function scanRobinhood(env) {
+  if (!env.BITQUERY_TOKEN) return { configured: false, checked: 0, message: "Add BITQUERY_TOKEN to enable" };
+
+  try {
+    const launches = await getRobinhoodLaunches(env.BITQUERY_TOKEN);
+    const now = Date.now();
+    const savedWatch = parseJsonArray(await stateGet(env, "robinhood_watch"));
+    const savedAlerted = new Set(parseJsonArray(await stateGet(env, "robinhood_alerted")));
+    const watch = new Map();
+
+    for (const item of savedWatch) {
+      if (item?.contract && now - num(item.firstSeen) < 3 * 60 * 60 * 1000) {
+        watch.set(String(item.contract).toLowerCase(), item);
+      }
+    }
+    for (const item of launches) {
+      const key = item.contract.toLowerCase();
+      if (!savedAlerted.has(key) && !watch.has(key)) watch.set(key, { ...item, firstSeen: now });
+    }
+
+    const results = [];
+    for (const item of [...watch.values()].slice(0, 40)) {
+      const key = item.contract.toLowerCase();
+      try {
+        const pair = await getBestPair(item.contract, null, ROBINHOOD_CHAIN_ID);
+        const call = { ...item, name: pair?.baseToken?.name || pair?.baseToken?.symbol || "Robinhood token", paid: false, source: "ROBINHOOD" };
+        const review = scorePair(call, pair, "Robinhood Chain");
+        if (pair && review.score >= ROBINHOOD_MIN_SCORE && review.marketCap <= MAX_MARKET_CAP) {
+          await sendTelegram(env, formatAlert(call, pair, review));
+          savedAlerted.add(key);
+          watch.delete(key);
+          results.push({ contract: item.contract, alerted: true, score: review.score });
+        } else {
+          results.push({ contract: item.contract, alerted: false, score: review.score });
+        }
+      } catch (error) {
+        results.push({ contract: item.contract, error: String(error) });
+      }
+    }
+
+    await statePut(env, JSON.stringify([...watch.values()].slice(0, 100)), "robinhood_watch");
+    await statePut(env, JSON.stringify([...savedAlerted].slice(-500)), "robinhood_alerted");
+    return { configured: true, launches: launches.length, checked: Math.min(watch.size + savedAlerted.size, 40), results };
+  } catch (error) {
+    return { configured: true, checked: 0, error: String(error) };
+  }
+}
+
+async function getRobinhoodLaunches(token) {
+  const query = `{
+    EVM(network: robinhood) {
+      Events(
+        limit: {count: 25}
+        orderBy: {descending: Block_Time}
+        where: {
+          LogHeader: {Address: {in: [${ROBINHOOD_ENTRY_CONTRACTS.map((a) => `"${a}"`).join(",")} ]}}
+          Log: {Signature: {Name: {is: "TokenCreated"}}}
+        }
+      ) {
+        Block { Time Number }
+        Transaction { Hash From }
+        Arguments {
+          Name
+          Value { ... on EVM_ABI_Address_Value_Arg { address } }
+        }
+      }
+    }
+  }`;
+  const response = await fetch(BITQUERY_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json", Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ query }),
+  });
+  const payload = await check(response).then((r) => r.json());
+  if (payload.errors?.length) throw new Error(payload.errors.map((e) => e.message).join("; "));
+  const events = payload?.data?.EVM?.Events || [];
+  const unique = new Map();
+  for (const event of events) {
+    const arg = (event.Arguments || []).find((a) => a?.Value?.address);
+    const contract = arg?.Value?.address;
+    if (!/^0x[a-f0-9]{40}$/i.test(contract || "")) continue;
+    unique.set(contract.toLowerCase(), {
+      contract,
+      creator: event?.Transaction?.From || null,
+      launchTx: event?.Transaction?.Hash || null,
+      launchedAt: event?.Block?.Time || null,
+    });
+  }
+  return [...unique.values()];
 }
 
 async function scanRaydium(env) {
@@ -201,17 +302,17 @@ function parseCalls(html) {
   return calls;
 }
 
-async function getBestPair(contract, dexId = null) {
+async function getBestPair(contract, dexId = null, chainId = "solana") {
   const response = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${contract}`);
   const data = await check(response).then((r) => r.json());
   const pairs = (data.pairs || []).filter((p) =>
-    p.chainId === "solana" && (!dexId || String(p.dexId).toLowerCase().includes(dexId))
+    p.chainId === chainId && (!dexId || String(p.dexId).toLowerCase().includes(dexId))
   );
   return pairs.sort((a, b) => num(b.liquidity?.usd) - num(a.liquidity?.usd))[0] || null;
 }
 
-function scorePair(call, pair) {
-  if (!pair) return { score: 0, marketCap: Infinity, reasons: ["No Solana pool"] };
+function scorePair(call, pair, chainName = "Solana") {
+  if (!pair) return { score: 0, marketCap: Infinity, reasons: [`No ${chainName} pool indexed yet`] };
   const marketCap = num(pair.marketCap || pair.fdv);
   const liquidity = num(pair.liquidity?.usd);
   const volumeH1 = num(pair.volume?.h1);
@@ -236,9 +337,10 @@ function scorePair(call, pair) {
 }
 
 function formatAlert(call, pair, r) {
-  const link = pair?.url || `https://dexscreener.com/solana/${call.contract}`;
+  const chainPath = call.source === "ROBINHOOD" ? "robinhood" : "solana";
+  const link = pair?.url || `https://dexscreener.com/${chainPath}/${call.contract}`;
 
-  const source = call.source === "RAYDIUM" ? "RAYDIUM" : "SEEKR";
+  const source = call.source === "RAYDIUM" ? "RAYDIUM" : call.source === "ROBINHOOD" ? "ROBINHOOD CHAIN" : "SEEKR";
   return [
     `🚨 <b>${source} CANDIDATE — ${esc(call.name)}</b>`,
     `Score: <b>${r.score}/9</b>`,
