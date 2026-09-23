@@ -4,6 +4,11 @@ const MIN_LIQUIDITY = 10_000;
 const MIN_SCORE = 1;
 const ROBINHOOD_MIN_SCORE = 4;
 const BNB_MIN_SCORE = 4;
+const MAX_SINGLE_HOLDER_PCT = 15;
+const MAX_TOP_10_HOLDERS_PCT = 45;
+const MAX_INSIDER_HOLDINGS_PCT = 20;
+const MAX_TRANSFER_FEE_PCT = 5;
+const MAX_RUGCHECK_SCORE = 49;
 
 const BITQUERY_URL = "https://streaming.bitquery.io/graphql";
 const ROBINHOOD_CHAIN_ID = "robinhood";
@@ -104,11 +109,12 @@ async function scan(env) {
     try {
       const pair = await getBestPair(call.contract);
       const review = scorePair(call, pair);
-      if (review.score >= MIN_SCORE && review.marketCap <= MAX_MARKET_CAP) {
-        await sendTelegram(env, formatAlert(call, pair, review));
-        results.push({ contract: call.contract, alerted: true, score: review.score });
+      const safety = await getSolanaSafety(call.contract);
+      if (safety.passed && passesMarketSafety(review) && review.score >= MIN_SCORE && review.marketCap <= MAX_MARKET_CAP) {
+        await sendTelegram(env, formatAlert(call, pair, { ...review, safety }));
+        results.push({ contract: call.contract, alerted: true, score: review.score, safety: safety.summary });
       } else {
-        results.push({ contract: call.contract, alerted: false, score: review.score });
+        results.push({ contract: call.contract, alerted: false, score: review.score, safety: safety.summary });
       }
     } catch (error) {
       results.push({ contract: call.contract, error: String(error) });
@@ -154,7 +160,7 @@ async function scanBnb(env) {
         const safety = safeties.get(key) || { passed: false, summary: "GoPlus data unavailable" };
         const call = { ...item, name: item.name || pair?.baseToken?.name || pair?.baseToken?.symbol || "BNB token", paid: false, source: "BNB" };
         const review = scorePair(call, pair, "BNB Chain");
-        if (pair && safety.passed && review.score >= BNB_MIN_SCORE && review.marketCap <= MAX_MARKET_CAP) {
+        if (pair && safety.passed && passesMarketSafety(review) && review.score >= BNB_MIN_SCORE && review.marketCap <= MAX_MARKET_CAP) {
           await sendTelegram(env, formatAlert(call, pair, { ...review, safety }));
           savedAlerted.add(key);
           watch.delete(key);
@@ -287,7 +293,7 @@ async function scanRobinhood(env) {
         const pair = await getBestPair(item.contract, null, ROBINHOOD_CHAIN_ID);
         const call = { ...item, name: pair?.baseToken?.name || pair?.baseToken?.symbol || "Robinhood token", paid: false, source: "ROBINHOOD" };
         const review = scorePair(call, pair, "Robinhood Chain");
-        if (pair && review.score >= ROBINHOOD_MIN_SCORE && review.marketCap <= MAX_MARKET_CAP) {
+        if (pair && passesMarketSafety(review) && review.score >= ROBINHOOD_MIN_SCORE && review.marketCap <= MAX_MARKET_CAP) {
           await sendTelegram(env, formatAlert(call, pair, review));
           savedAlerted.add(key);
           watch.delete(key);
@@ -393,11 +399,12 @@ async function scanRaydium(env) {
       try {
         const pair = await getBestPair(call.contract, "raydium");
         const review = scorePair(call, pair);
-        if (pair && review.score >= MIN_SCORE && review.marketCap <= MAX_MARKET_CAP) {
-          await sendTelegram(env, formatAlert(call, pair, review));
-          results.push({ contract: call.contract, alerted: true, score: review.score });
+        const safety = await getSolanaSafety(call.contract);
+        if (pair && safety.passed && passesMarketSafety(review) && review.score >= MIN_SCORE && review.marketCap <= MAX_MARKET_CAP) {
+          await sendTelegram(env, formatAlert(call, pair, { ...review, safety }));
+          results.push({ contract: call.contract, alerted: true, score: review.score, safety: safety.summary });
         } else {
-          results.push({ contract: call.contract, alerted: false, score: review.score });
+          results.push({ contract: call.contract, alerted: false, score: review.score, safety: safety.summary });
         }
       } catch (error) {
         results.push({ contract: call.contract, error: String(error) });
@@ -466,6 +473,62 @@ async function getBestPairs(contracts, chainId) {
     }
   }
   return best;
+}
+
+async function getSolanaSafety(contract) {
+  try {
+    const response = await fetch(`https://api.rugcheck.xyz/v1/tokens/${contract}/report`, {
+      headers: { "User-Agent": "SeekrSafetyGate/1.0" },
+    });
+    const data = await check(response).then((r) => r.json());
+    return reviewSolanaSafety(data);
+  } catch (error) {
+    // Fail closed: an unavailable safety report must never become an alert.
+    return { passed: false, summary: `blocked: safety report unavailable (${String(error)})` };
+  }
+}
+
+function reviewSolanaSafety(data) {
+  if (!data) return { passed: false, summary: "blocked: Rugcheck data unavailable" };
+
+  const blockers = [];
+  const mintAuthority = data.mintAuthority ?? data.token?.mintAuthority;
+  const freezeAuthority = data.freezeAuthority ?? data.token?.freezeAuthority;
+  const transferFeePct = num(data.transferFee?.pct);
+  const rugScore = num(data.score_normalised);
+  const holders = Array.isArray(data.topHolders) ? data.topHolders.slice(0, 10) : [];
+  const topHolderPct = holders.length ? Math.max(...holders.map((h) => num(h?.pct))) : 0;
+  const top10Pct = holders.reduce((sum, h) => sum + num(h?.pct), 0);
+  const insiderPct = holders.filter((h) => h?.insider).reduce((sum, h) => sum + num(h?.pct), 0);
+  const dangerousRisks = (Array.isArray(data.risks) ? data.risks : [])
+    .filter((risk) => String(risk?.level || "").toLowerCase() === "danger")
+    .map((risk) => risk?.name || risk?.description || "dangerous Rugcheck flag");
+
+  if (data.rugged === true) blockers.push("Rugcheck rugged flag");
+  if (mintAuthority) blockers.push("mint authority enabled");
+  if (freezeAuthority) blockers.push("freeze authority enabled");
+  if (transferFeePct > MAX_TRANSFER_FEE_PCT) blockers.push(`transfer fee ${transferFeePct.toFixed(1)}%`);
+  if (rugScore > MAX_RUGCHECK_SCORE) blockers.push(`Rugcheck risk score ${rugScore.toFixed(0)}`);
+  if (topHolderPct > MAX_SINGLE_HOLDER_PCT) blockers.push(`largest holder ${topHolderPct.toFixed(1)}%`);
+  if (top10Pct > MAX_TOP_10_HOLDERS_PCT) blockers.push(`top 10 hold ${top10Pct.toFixed(1)}%`);
+  if (insiderPct > MAX_INSIDER_HOLDINGS_PCT) blockers.push(`known insiders hold ${insiderPct.toFixed(1)}%`);
+  blockers.push(...dangerousRisks.slice(0, 3));
+
+  const details = `Rugcheck ${rugScore.toFixed(0)}; top holder ${topHolderPct.toFixed(1)}%; top 10 ${top10Pct.toFixed(1)}%`;
+  return {
+    passed: blockers.length === 0,
+    summary: blockers.length ? `blocked: ${blockers.join(", ")}` : `passed; ${details}`,
+    rugScore,
+    topHolderPct,
+    top10Pct,
+    insiderPct,
+  };
+}
+
+function passesMarketSafety(review) {
+  if (!review || !Number.isFinite(review.marketCap) || review.marketCap <= 0) return false;
+  if (review.liquidity < MIN_LIQUIDITY) return false;
+  return review.liquidity / review.marketCap >= 0.01;
 }
 
 function scorePair(call, pair, chainName = "Solana") {
