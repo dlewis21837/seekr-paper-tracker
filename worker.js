@@ -3,6 +3,7 @@ const MAX_MARKET_CAP = 3_000_000;
 const MIN_LIQUIDITY = 10_000;
 const MIN_SCORE = 1;
 const ROBINHOOD_MIN_SCORE = 4;
+const BNB_MIN_SCORE = 4;
 
 const BITQUERY_URL = "https://streaming.bitquery.io/graphql";
 const ROBINHOOD_CHAIN_ID = "robinhood";
@@ -10,6 +11,8 @@ const ROBINHOOD_ENTRY_CONTRACTS = [
   "0x0000ffffbe8efe702c8703ae3477ff5de3d319c0",
   "0x00004c4ccc709ef590f7c81102c0689f0263d4e9",
 ];
+const FOUR_MEME_FACTORY = "0x5c952063c7fc8610ffdb798152d69f0b9550762b";
+const BNB_CHAIN_ID = "bsc";
 
 const RAYDIUM_POOLS_URL = "https://api-v3.raydium.io/pools/info/list?poolType=all&poolSortField=default&sortType=desc&pageSize=100&page=1";
 const SOL_MINT = "So11111111111111111111111111111111111111112";
@@ -26,10 +29,11 @@ export default {
       return Response.json(result);
     }
     return Response.json({
-      status: "Seekr + Raydium + Robinhood Chain tracker online",
+      status: "Seekr + Raydium + Robinhood Chain + BNB Chain tracker online",
       schedule: "Every 3 minutes, 5:00 a.m.–8:00 p.m. Pacific",
       configured: Boolean(env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID && env.STATE),
       robinhoodConfigured: Boolean(env.BITQUERY_TOKEN),
+      bnbConfigured: Boolean(env.BITQUERY_TOKEN),
     });
   },
 
@@ -114,10 +118,126 @@ async function scan(env) {
   if (newestId > lastId) await statePut(env, newestId);
   const raydium = await scanRaydium(env);
   const robinhood = await scanRobinhood(env);
+  const bnb = await scanBnb(env);
   if (connected) {
-    await sendTelegram(env, "✅ Seekr + Raydium + Robinhood Chain tracker connected. Scanning every 3 minutes from 5:00 a.m. to 8:00 p.m. Pacific.");
+    await sendTelegram(env, "✅ Seekr + Raydium + Robinhood Chain + BNB Chain tracker connected. Scanning every 3 minutes from 5:00 a.m. to 8:00 p.m. Pacific.");
   }
-  return { ok: true, seekrChecked: fresh.length, seekrResults: results, raydium, robinhood };
+  return { ok: true, seekrChecked: fresh.length, seekrResults: results, raydium, robinhood, bnb };
+}
+
+async function scanBnb(env) {
+  if (!env.BITQUERY_TOKEN) return { configured: false, checked: 0, message: "Add BITQUERY_TOKEN to enable" };
+  try {
+    const launches = await getBnbLaunches(env.BITQUERY_TOKEN);
+    const now = Date.now();
+    const savedWatch = parseJsonArray(await stateGet(env, "bnb_watch"));
+    const savedAlerted = new Set(parseJsonArray(await stateGet(env, "bnb_alerted")));
+    const watch = new Map();
+    for (const item of savedWatch) {
+      if (item?.contract && now - num(item.firstSeen) < 3 * 60 * 60 * 1000) watch.set(String(item.contract).toLowerCase(), item);
+    }
+    for (const item of launches) {
+      const key = item.contract.toLowerCase();
+      if (!savedAlerted.has(key) && !watch.has(key)) watch.set(key, { ...item, firstSeen: now });
+    }
+    const results = [];
+    const candidates = [...watch.values()].slice(0, 20);
+    for (const item of candidates) {
+      const key = item.contract.toLowerCase();
+      try {
+        const [pair, safety] = await Promise.all([getBestPair(item.contract, null, BNB_CHAIN_ID), getBnbSafety(item.contract)]);
+        const call = { ...item, name: item.name || pair?.baseToken?.name || pair?.baseToken?.symbol || "BNB token", paid: false, source: "BNB" };
+        const review = scorePair(call, pair, "BNB Chain");
+        if (pair && safety.passed && review.score >= BNB_MIN_SCORE && review.marketCap <= MAX_MARKET_CAP) {
+          await sendTelegram(env, formatAlert(call, pair, { ...review, safety }));
+          savedAlerted.add(key);
+          watch.delete(key);
+          results.push({ contract: item.contract, alerted: true, score: review.score, safety: safety.summary });
+        } else results.push({ contract: item.contract, alerted: false, score: review.score, safety: safety.summary });
+      } catch (error) {
+        results.push({ contract: item.contract, error: String(error) });
+      }
+    }
+    await statePut(env, JSON.stringify([...watch.values()].slice(0, 100)), "bnb_watch");
+    await statePut(env, JSON.stringify([...savedAlerted].slice(-500)), "bnb_alerted");
+    return { configured: true, launches: launches.length, checked: candidates.length, results };
+  } catch (error) {
+    return { configured: true, checked: 0, error: String(error) };
+  }
+}
+
+async function getBnbLaunches(token) {
+  const query = `{
+    EVM(dataset: realtime, network: bsc) {
+      Events(
+        limit: {count: 25}
+        orderBy: {descending: Block_Time}
+        where: {
+          Transaction: {To: {is: "${FOUR_MEME_FACTORY}"}}
+          Log: {Signature: {Name: {is: "TokenCreate"}}}
+        }
+      ) {
+        Block { Time Number }
+        Transaction { Hash From }
+        Arguments {
+          Name
+          Value {
+            ... on EVM_ABI_Address_Value_Arg { address }
+            ... on EVM_ABI_String_Value_Arg { string }
+          }
+        }
+      }
+    }
+  }`;
+  const response = await fetch(BITQUERY_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json", Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ query }),
+  });
+  const payload = await check(response).then((r) => r.json());
+  if (payload.errors?.length) throw new Error(payload.errors.map((e) => e.message).join("; "));
+  const unique = new Map();
+  for (const event of payload?.data?.EVM?.Events || []) {
+    const args = Object.fromEntries((event.Arguments || []).map((arg) => [String(arg?.Name || "").toLowerCase(), arg?.Value]));
+    const contract = args.token?.address;
+    if (!/^0x[a-f0-9]{40}$/i.test(contract || "")) continue;
+    unique.set(contract.toLowerCase(), {
+      contract,
+      creator: args.creator?.address || event?.Transaction?.From || null,
+      name: args.name?.string || args.symbol?.string || "Four.meme token",
+      symbol: args.symbol?.string || null,
+      launchTx: event?.Transaction?.Hash || null,
+      launchedAt: event?.Block?.Time || null,
+      launchSource: "Four.meme",
+    });
+  }
+  return [...unique.values()];
+}
+
+async function getBnbSafety(contract) {
+  const url = `https://api.gopluslabs.io/api/v1/token_security/56?contract_addresses=${encodeURIComponent(contract)}`;
+  const response = await fetch(url, { headers: { "User-Agent": "SeekrBnbTracker/1.0" } });
+  const payload = await check(response).then((r) => r.json());
+  const data = payload?.result?.[contract.toLowerCase()];
+  if (!data) return { passed: false, summary: "GoPlus data unavailable" };
+  const buyTax = taxPercent(data.buy_tax);
+  const sellTax = taxPercent(data.sell_tax);
+  const blockers = [];
+  if (data.is_honeypot === "1") blockers.push("honeypot flag");
+  if (data.cannot_sell_all === "1") blockers.push("cannot sell all");
+  if (data.is_blacklisted === "1") blockers.push("blacklist flag");
+  if (data.transfer_pausable === "1") blockers.push("transfers pausable");
+  if (data.owner_change_balance === "1") blockers.push("owner can alter balances");
+  if (data.is_open_source === "0") blockers.push("closed source");
+  if (buyTax > 10) blockers.push(`buy tax ${buyTax.toFixed(1)}%`);
+  if (sellTax > 10) blockers.push(`sell tax ${sellTax.toFixed(1)}%`);
+  const summary = blockers.length ? `blocked: ${blockers.join(", ")}` : `passed; tax ${buyTax.toFixed(1)}% buy / ${sellTax.toFixed(1)}% sell`;
+  return { passed: blockers.length === 0, summary, buyTax, sellTax };
+}
+
+function taxPercent(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n * 100 : 0;
 }
 
 async function scanRobinhood(env) {
@@ -337,11 +457,11 @@ function scorePair(call, pair, chainName = "Solana") {
 }
 
 function formatAlert(call, pair, r) {
-  const chainPath = call.source === "ROBINHOOD" ? "robinhood" : "solana";
+  const chainPath = call.source === "ROBINHOOD" ? "robinhood" : call.source === "BNB" ? "bsc" : "solana";
   const link = pair?.url || `https://dexscreener.com/${chainPath}/${call.contract}`;
 
-  const source = call.source === "RAYDIUM" ? "RAYDIUM" : call.source === "ROBINHOOD" ? "ROBINHOOD CHAIN" : "SEEKR";
-  return [
+  const source = call.source === "RAYDIUM" ? "RAYDIUM" : call.source === "ROBINHOOD" ? "ROBINHOOD CHAIN" : call.source === "BNB" ? "BNB CHAIN" : "SEEKR";
+  const lines = [
     `🚨 <b>${source} CANDIDATE — ${esc(call.name)}</b>`,
     `Score: <b>${r.score}/9</b>`,
     `Market cap: <b>${usd(r.marketCap)}</b>`,
@@ -349,10 +469,11 @@ function formatAlert(call, pair, r) {
     `1h volume: ${usd(r.volumeH1)}`,
     `1h change: ${r.changeH1.toFixed(1)}%`,
     `1h buys/sells: ${r.buys}/${r.sells}`,
-    `Why: ${esc(r.reasons.join(", "))}`,`CA: <a href="${link}">${call.contract}</a>`,
-
-    "⚠️ Preliminary alert only—verify holders, insiders, bundlers and socials before risking money.",
-  ].join("\n");
+    `Why: ${esc(r.reasons.join(", "))}`,
+  ];
+  if (r.safety) lines.push(`Safety: ${esc(r.safety.summary)}`);
+  lines.push(`CA: <a href="${link}">${call.contract}</a>`, "⚠️ Preliminary alert only—verify holders, insiders, bundlers and socials before risking money.");
+  return lines.join("\n");
 }
 
 async function sendTelegram(env, text) {
