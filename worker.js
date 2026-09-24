@@ -1,5 +1,5 @@
 const CHANNEL = "SeekrTrending";
-const BUILD_ID = "drawdown-proof-v3-2026-09-24";
+const BUILD_ID = "balanced-safety-v4-2026-09-24";
 const MAX_MARKET_CAP = 3_000_000;
 const MIN_LIQUIDITY = 10_000;
 const MIN_SCORE = 1;
@@ -597,14 +597,14 @@ function reviewSolanaSafety(data) {
   if (creatorPct > MAX_CREATOR_HOLDINGS_PCT) blockers.push(`creator/developer holds ${creatorPct.toFixed(1)}%`);
   if (suspiciousHolders.length > MAX_SUSPICIOUS_HOLDERS) blockers.push(`${suspiciousHolders.length} suspicious bundled/sniper/insider top holder(s)`);
   if (materialUnlockedPools.length) blockers.push(`${materialUnlockedPools.length} material unlocked secondary pool(s)`);
-  blockers.push(...copycatRisks.slice(0, 2));
   blockers.push(...dangerousRisks.slice(0, 3));
   blockers.push(...bundleRisks.slice(0, 3));
 
   const details = `Rugcheck ${rugScore.toFixed(0)}; LP locked/burned ${lpLockedPct.toFixed(1)}%; creator ${creatorPct.toFixed(1)}%; top holder ${topHolderPct.toFixed(1)}%; top 10 ${top10Pct.toFixed(1)}%`;
+  const warning = copycatRisks.length ? `; WARNING: ${copycatRisks.slice(0, 2).join(", ")}` : "";
   return {
     passed: blockers.length === 0,
-    summary: blockers.length ? `blocked: ${blockers.join(", ")}` : `passed; ${details}`,
+    summary: blockers.length ? `blocked: ${blockers.join(", ")}${warning}` : `passed; ${details}${warning}`,
     rugScore,
     topHolderPct,
     top10Pct,
