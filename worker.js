@@ -15,6 +15,10 @@ const MAX_TOP_10_HOLDERS_PCT = 45;
 const MAX_INSIDER_HOLDINGS_PCT = 20;
 const MAX_TRANSFER_FEE_PCT = 5;
 const MAX_RUGCHECK_SCORE = 49;
+const MIN_LP_LOCKED_PCT = 80;
+const MIN_LP_LOCKED_USD = 10_000;
+const MAX_CREATOR_HOLDINGS_PCT = 5;
+const MAX_SUSPICIOUS_HOLDERS = 0;
 
 const BITQUERY_URL = "https://streaming.bitquery.io/graphql";
 const ROBINHOOD_CHAIN_ID = "robinhood";
@@ -506,15 +510,42 @@ function reviewSolanaSafety(data) {
   const freezeAuthority = data.freezeAuthority ?? data.token?.freezeAuthority;
   const transferFeePct = num(data.transferFee?.pct);
   const rugScore = num(data.score_normalised);
-  const holders = Array.isArray(data.topHolders) ? data.topHolders.slice(0, 10) : [];
+  const allHolders = Array.isArray(data.topHolders) ? data.topHolders : [];
+  const holders = allHolders.slice(0, 10);
   const topHolderPct = holders.length ? Math.max(...holders.map((h) => num(h?.pct))) : 0;
   const top10Pct = holders.reduce((sum, h) => sum + num(h?.pct), 0);
   const insiderPct = holders.filter((h) => h?.insider).reduce((sum, h) => sum + num(h?.pct), 0);
+  const creator = String(data.creator || "").toLowerCase();
+  const creatorPct = creator
+    ? allHolders.filter((h) => String(h?.owner || h?.address || "").toLowerCase() === creator)
+      .reduce((sum, h) => sum + num(h?.pct), 0)
+    : num(data.creatorBalancePct);
+  const knownAccounts = data.knownAccounts && typeof data.knownAccounts === "object" ? data.knownAccounts : {};
+  const suspiciousHolders = holders.filter((holder) => {
+    if (holder?.insider === true) return true;
+    const address = String(holder?.owner || holder?.address || "");
+    const label = `${holder?.name || ""} ${holder?.label || ""} ${knownAccounts[address]?.name || ""} ${knownAccounts[address]?.type || ""}`;
+    return /bundle|bundler|snip|insider|creator|developer|deployer/i.test(label);
+  });
+  const markets = Array.isArray(data.markets) ? data.markets : [];
+  const lpMarkets = markets.map((market) => market?.lp).filter(Boolean);
+  const bestLp = lpMarkets.sort((a, b) => num(b?.lpLockedUSD) - num(a?.lpLockedUSD))[0] || null;
+  const lpLockedPct = num(bestLp?.lpLockedPct);
+  const lpLockedUsd = num(bestLp?.lpLockedUSD);
   const dangerousRisks = (Array.isArray(data.risks) ? data.risks : [])
     .filter((risk) => String(risk?.level || "").toLowerCase() === "danger")
     .map((risk) => risk?.name || risk?.description || "dangerous Rugcheck flag");
+  const bundleRisks = (Array.isArray(data.risks) ? data.risks : [])
+    .filter((risk) => /bundle|bundler|snip|insider|creator|developer|deployer/i.test(`${risk?.name || ""} ${risk?.description || ""}`))
+    .map((risk) => risk?.name || risk?.description || "bundled/sniper activity");
 
   if (data.rugged === true) blockers.push("Rugcheck rugged flag");
+  if (!holders.length) blockers.push("holder data unavailable");
+  if (!bestLp) blockers.push("LP lock/burn data unavailable");
+  else {
+    if (lpLockedPct < MIN_LP_LOCKED_PCT) blockers.push(`only ${lpLockedPct.toFixed(1)}% of LP locked/burned`);
+    if (lpLockedUsd < MIN_LP_LOCKED_USD) blockers.push(`only $${Math.round(lpLockedUsd).toLocaleString("en-US")} locked liquidity`);
+  }
   if (mintAuthority) blockers.push("mint authority enabled");
   if (freezeAuthority) blockers.push("freeze authority enabled");
   if (transferFeePct > MAX_TRANSFER_FEE_PCT) blockers.push(`transfer fee ${transferFeePct.toFixed(1)}%`);
@@ -522,9 +553,12 @@ function reviewSolanaSafety(data) {
   if (topHolderPct > MAX_SINGLE_HOLDER_PCT) blockers.push(`largest holder ${topHolderPct.toFixed(1)}%`);
   if (top10Pct > MAX_TOP_10_HOLDERS_PCT) blockers.push(`top 10 hold ${top10Pct.toFixed(1)}%`);
   if (insiderPct > MAX_INSIDER_HOLDINGS_PCT) blockers.push(`known insiders hold ${insiderPct.toFixed(1)}%`);
+  if (creatorPct > MAX_CREATOR_HOLDINGS_PCT) blockers.push(`creator/developer holds ${creatorPct.toFixed(1)}%`);
+  if (suspiciousHolders.length > MAX_SUSPICIOUS_HOLDERS) blockers.push(`${suspiciousHolders.length} suspicious bundled/sniper/insider top holder(s)`);
   blockers.push(...dangerousRisks.slice(0, 3));
+  blockers.push(...bundleRisks.slice(0, 3));
 
-  const details = `Rugcheck ${rugScore.toFixed(0)}; top holder ${topHolderPct.toFixed(1)}%; top 10 ${top10Pct.toFixed(1)}%`;
+  const details = `Rugcheck ${rugScore.toFixed(0)}; LP locked/burned ${lpLockedPct.toFixed(1)}%; creator ${creatorPct.toFixed(1)}%; top holder ${topHolderPct.toFixed(1)}%; top 10 ${top10Pct.toFixed(1)}%`;
   return {
     passed: blockers.length === 0,
     summary: blockers.length ? `blocked: ${blockers.join(", ")}` : `passed; ${details}`,
@@ -532,6 +566,10 @@ function reviewSolanaSafety(data) {
     topHolderPct,
     top10Pct,
     insiderPct,
+    creatorPct,
+    lpLockedPct,
+    lpLockedUsd,
+    suspiciousHolderCount: suspiciousHolders.length,
   };
 }
 
