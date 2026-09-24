@@ -1,5 +1,5 @@
 const CHANNEL = "SeekrTrending";
-const BUILD_ID = "balanced-safety-v4-2026-09-24";
+const BUILD_ID = "balanced-safety-v5-2026-09-24";
 const MAX_MARKET_CAP = 3_000_000;
 const MIN_LIQUIDITY = 10_000;
 const MIN_SCORE = 1;
@@ -130,11 +130,12 @@ async function scan(env) {
       const confirmation = await confirmMarketMomentum(call, pair);
       const review = confirmation.review;
       const safety = await getSolanaSafety(call.contract);
-      if (safety.passed && confirmation.passed && review.score >= MIN_SCORE && review.marketCap <= MAX_MARKET_CAP) {
-        await sendTelegram(env, formatAlert(call, confirmation.pair, { ...review, safety, confirmation }));
-        results.push({ contract: call.contract, alerted: true, score: review.score, safety: safety.summary });
+      const effectiveScore = review.score - num(safety.scorePenalty);
+      if (safety.passed && confirmation.passed && effectiveScore >= MIN_SCORE && review.marketCap <= MAX_MARKET_CAP) {
+        await sendTelegram(env, formatAlert(call, confirmation.pair, { ...review, score: effectiveScore, safety, confirmation }));
+        results.push({ contract: call.contract, alerted: true, score: effectiveScore, rawScore: review.score, safety: safety.summary });
       } else {
-        results.push({ contract: call.contract, alerted: false, score: review.score, safety: safety.summary, marketGate: confirmation.summary });
+        results.push({ contract: call.contract, alerted: false, score: effectiveScore, rawScore: review.score, safety: safety.summary, marketGate: confirmation.summary });
       }
     } catch (error) {
       results.push({ contract: call.contract, error: String(error) });
@@ -423,11 +424,12 @@ async function scanRaydium(env) {
         const confirmation = await confirmMarketMomentum(call, pair, { dexId: "raydium" });
         const review = confirmation.review;
         const safety = await getSolanaSafety(call.contract);
-        if (pair && safety.passed && confirmation.passed && review.score >= MIN_SCORE && review.marketCap <= MAX_MARKET_CAP) {
-          await sendTelegram(env, formatAlert(call, confirmation.pair, { ...review, safety, confirmation }));
-          results.push({ contract: call.contract, alerted: true, score: review.score, safety: safety.summary });
+        const effectiveScore = review.score - num(safety.scorePenalty);
+        if (pair && safety.passed && confirmation.passed && effectiveScore >= MIN_SCORE && review.marketCap <= MAX_MARKET_CAP) {
+          await sendTelegram(env, formatAlert(call, confirmation.pair, { ...review, score: effectiveScore, safety, confirmation }));
+          results.push({ contract: call.contract, alerted: true, score: effectiveScore, rawScore: review.score, safety: safety.summary });
         } else {
-          results.push({ contract: call.contract, alerted: false, score: review.score, safety: safety.summary, marketGate: confirmation.summary });
+          results.push({ contract: call.contract, alerted: false, score: effectiveScore, rawScore: review.score, safety: safety.summary, marketGate: confirmation.summary });
         }
       } catch (error) {
         results.push({ contract: call.contract, error: String(error) });
@@ -557,7 +559,7 @@ function reviewSolanaSafety(data) {
     if (holder?.insider === true) return true;
     const address = String(holder?.owner || holder?.address || "");
     const label = `${holder?.name || ""} ${holder?.label || ""} ${knownAccounts[address]?.name || ""} ${knownAccounts[address]?.type || ""}`;
-    return /bundle|bundler|snip|insider|creator|developer|deployer/i.test(label);
+    return /bundle|bundler|snip|insider/i.test(label);
   });
   const markets = Array.isArray(data.markets) ? data.markets : [];
   const lpMarkets = markets.map((market) => market?.lp).filter(Boolean);
@@ -573,11 +575,21 @@ function reviewSolanaSafety(data) {
   const copycatRisks = (Array.isArray(data.risks) ? data.risks : [])
     .filter((risk) => /copycat|impersonat|fake token|verified token/i.test(`${risk?.name || ""} ${risk?.description || ""}`))
     .map((risk) => risk?.name || risk?.description || "copycat/impersonation warning");
-  const dangerousRisks = (Array.isArray(data.risks) ? data.risks : [])
+  const risks = Array.isArray(data.risks) ? data.risks : [];
+  const riskText = (risk) => `${risk?.name || ""} ${risk?.description || ""}`;
+  const priorRugRisks = risks
+    .filter((risk) => /creator|developer|deployer/i.test(riskText(risk)) && /rug|scam|honeypot/i.test(riskText(risk)))
+    .map((risk) => risk?.name || risk?.description || "creator linked to prior rug");
+  const repeatCreatorRisks = risks
+    .filter((risk) => /creator|developer|deployer/i.test(riskText(risk)) && /created|launched|deployed|previous|tokens?|coins?/i.test(riskText(risk)) && !/rug|scam|honeypot/i.test(riskText(risk)))
+    .map((risk) => risk?.name || risk?.description || "repeat creator/deployer");
+  const dangerousRisks = risks
     .filter((risk) => String(risk?.level || "").toLowerCase() === "danger")
+    .filter((risk) => !repeatCreatorRisks.includes(risk?.name || risk?.description || "repeat creator/deployer"))
+    .filter((risk) => !priorRugRisks.includes(risk?.name || risk?.description || "creator linked to prior rug"))
     .map((risk) => risk?.name || risk?.description || "dangerous Rugcheck flag");
-  const bundleRisks = (Array.isArray(data.risks) ? data.risks : [])
-    .filter((risk) => /bundle|bundler|snip|insider|creator|developer|deployer/i.test(`${risk?.name || ""} ${risk?.description || ""}`))
+  const bundleRisks = risks
+    .filter((risk) => /bundle|bundler|snip|insider/i.test(riskText(risk)))
     .map((risk) => risk?.name || risk?.description || "bundled/sniper activity");
 
   if (data.rugged === true) blockers.push("Rugcheck rugged flag");
@@ -597,11 +609,14 @@ function reviewSolanaSafety(data) {
   if (creatorPct > MAX_CREATOR_HOLDINGS_PCT) blockers.push(`creator/developer holds ${creatorPct.toFixed(1)}%`);
   if (suspiciousHolders.length > MAX_SUSPICIOUS_HOLDERS) blockers.push(`${suspiciousHolders.length} suspicious bundled/sniper/insider top holder(s)`);
   if (materialUnlockedPools.length) blockers.push(`${materialUnlockedPools.length} material unlocked secondary pool(s)`);
+  blockers.push(...priorRugRisks.slice(0, 3));
   blockers.push(...dangerousRisks.slice(0, 3));
   blockers.push(...bundleRisks.slice(0, 3));
 
   const details = `Rugcheck ${rugScore.toFixed(0)}; LP locked/burned ${lpLockedPct.toFixed(1)}%; creator ${creatorPct.toFixed(1)}%; top holder ${topHolderPct.toFixed(1)}%; top 10 ${top10Pct.toFixed(1)}%`;
-  const warning = copycatRisks.length ? `; WARNING: ${copycatRisks.slice(0, 2).join(", ")}` : "";
+  const warnings = [...copycatRisks, ...repeatCreatorRisks];
+  const warning = warnings.length ? `; WARNING: ${warnings.slice(0, 3).join(", ")}` : "";
+  const scorePenalty = repeatCreatorRisks.length ? 1 : 0;
   return {
     passed: blockers.length === 0,
     summary: blockers.length ? `blocked: ${blockers.join(", ")}${warning}` : `passed; ${details}${warning}`,
@@ -615,6 +630,9 @@ function reviewSolanaSafety(data) {
     materialUnlockedPoolCount: materialUnlockedPools.length,
     copycatRiskCount: copycatRisks.length,
     suspiciousHolderCount: suspiciousHolders.length,
+    repeatCreatorRiskCount: repeatCreatorRisks.length,
+    priorRugRiskCount: priorRugRisks.length,
+    scorePenalty,
   };
 }
 
