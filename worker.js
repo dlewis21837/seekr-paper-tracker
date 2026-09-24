@@ -1,5 +1,5 @@
 const CHANNEL = "SeekrTrending";
-const BUILD_ID = "pool-proof-v2-2026-09-24";
+const BUILD_ID = "drawdown-proof-v3-2026-09-24";
 const MAX_MARKET_CAP = 3_000_000;
 const MIN_LIQUIDITY = 10_000;
 const MIN_SCORE = 1;
@@ -22,6 +22,8 @@ const MAX_TRANSFER_FEE_PCT = 5;
 const MAX_RUGCHECK_SCORE = 49;
 const MIN_LP_LOCKED_PCT = 80;
 const MIN_LP_LOCKED_USD = 10_000;
+const MIN_MATERIAL_UNLOCKED_POOL_USD = 2_000;
+const MIN_MATERIAL_UNLOCKED_POOL_RATIO = 0.02;
 const MAX_CREATOR_HOLDINGS_PCT = 5;
 const MAX_SUSPICIOUS_HOLDERS = 0;
 
@@ -562,6 +564,15 @@ function reviewSolanaSafety(data) {
   const bestLp = lpMarkets.sort((a, b) => num(b?.lpLockedUSD) - num(a?.lpLockedUSD))[0] || null;
   const lpLockedPct = num(bestLp?.lpLockedPct);
   const lpLockedUsd = num(bestLp?.lpLockedUSD);
+  const materialUnlockedPools = lpMarkets.filter((lp) => {
+    if (lp === bestLp || num(lp?.lpLockedPct) >= MIN_LP_LOCKED_PCT) return false;
+    const poolUsd = num(lp?.baseUSD) + num(lp?.quoteUSD);
+    return poolUsd >= MIN_MATERIAL_UNLOCKED_POOL_USD &&
+      poolUsd >= lpLockedUsd * MIN_MATERIAL_UNLOCKED_POOL_RATIO;
+  });
+  const copycatRisks = (Array.isArray(data.risks) ? data.risks : [])
+    .filter((risk) => /copycat|impersonat|fake token|verified token/i.test(`${risk?.name || ""} ${risk?.description || ""}`))
+    .map((risk) => risk?.name || risk?.description || "copycat/impersonation warning");
   const dangerousRisks = (Array.isArray(data.risks) ? data.risks : [])
     .filter((risk) => String(risk?.level || "").toLowerCase() === "danger")
     .map((risk) => risk?.name || risk?.description || "dangerous Rugcheck flag");
@@ -585,6 +596,8 @@ function reviewSolanaSafety(data) {
   if (insiderPct > MAX_INSIDER_HOLDINGS_PCT) blockers.push(`known insiders hold ${insiderPct.toFixed(1)}%`);
   if (creatorPct > MAX_CREATOR_HOLDINGS_PCT) blockers.push(`creator/developer holds ${creatorPct.toFixed(1)}%`);
   if (suspiciousHolders.length > MAX_SUSPICIOUS_HOLDERS) blockers.push(`${suspiciousHolders.length} suspicious bundled/sniper/insider top holder(s)`);
+  if (materialUnlockedPools.length) blockers.push(`${materialUnlockedPools.length} material unlocked secondary pool(s)`);
+  blockers.push(...copycatRisks.slice(0, 2));
   blockers.push(...dangerousRisks.slice(0, 3));
   blockers.push(...bundleRisks.slice(0, 3));
 
@@ -599,6 +612,8 @@ function reviewSolanaSafety(data) {
     creatorPct,
     lpLockedPct,
     lpLockedUsd,
+    materialUnlockedPoolCount: materialUnlockedPools.length,
+    copycatRiskCount: copycatRisks.length,
     suspiciousHolderCount: suspiciousHolders.length,
   };
 }
