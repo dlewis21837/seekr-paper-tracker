@@ -2,10 +2,14 @@ const CHANNEL = "SeekrTrending";
 const MAX_MARKET_CAP = 3_000_000;
 const MIN_LIQUIDITY = 10_000;
 const MIN_SCORE = 1;
-const FINAL_CONFIRM_DELAY_MS = 8_000;
+const FINAL_CONFIRM_DELAY_MS = 20_000;
 const MAX_5M_DROP_PCT = -15;
 const MAX_1H_DROP_PCT = -30;
 const MIN_BUY_SELL_RATIO = 0.8;
+const MIN_LIQUIDITY_TO_MARKET_CAP = 0.05;
+const MAX_ACTIVE_POOL_PRICE_SPREAD = 1.5;
+const MIN_POOL_INTEGRITY_LIQUIDITY = 1_000;
+const MIN_POOL_INTEGRITY_TRADES_H1 = 10;
 const MAX_CONFIRM_PRICE_DROP_PCT = 12;
 const MAX_CONFIRM_LIQUIDITY_DROP_PCT = 20;
 const ROBINHOOD_MIN_SCORE = 4;
@@ -33,8 +37,9 @@ const RAYDIUM_POOLS_URL = "https://api-v3.raydium.io/pools/info/list?poolType=al
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 const STABLE_MINTS = new Set([
   "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC
-  "Es9vMFrzaCERmJfrF4H2FYD6A7YKw2V9jR6KQ3K7hJ6", // USDT
+  "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", // USDT
 ]);
+const TRUSTED_SOLANA_QUOTES = new Set([SOL_MINT, ...STABLE_MINTS]);
 
 export default {
   async fetch(request, env) {
@@ -466,9 +471,32 @@ function parseCalls(html) {
 async function getBestPair(contract, dexId = null, chainId = "solana") {
   const response = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${contract}`);
   const data = await check(response).then((r) => r.json());
-  const pairs = (data.pairs || []).filter((p) =>
+  let pairs = (data.pairs || []).filter((p) =>
     p.chainId === chainId && (!dexId || String(p.dexId).toLowerCase().includes(dexId))
   );
+  if (chainId === "solana") {
+    // DexScreener can return the candidate as either side of a pool. The scoring
+    // fields describe the base token, so accepting a candidate on the quote side
+    // can score the wrong asset. Also reject pools quoted in another unproven token.
+    pairs = pairs.filter((p) =>
+      String(p?.baseToken?.address || "") === contract &&
+      TRUSTED_SOLANA_QUOTES.has(String(p?.quoteToken?.address || ""))
+    );
+
+    // Conflicting prices across meaningful, actively traded pools are a common
+    // migration/rug warning. Fail closed instead of trusting the largest pool.
+    const activePrices = pairs
+      .filter((p) =>
+        num(p?.liquidity?.usd) >= MIN_POOL_INTEGRITY_LIQUIDITY &&
+        num(p?.txns?.h1?.buys) + num(p?.txns?.h1?.sells) >= MIN_POOL_INTEGRITY_TRADES_H1
+      )
+      .map((p) => num(p?.priceUsd))
+      .filter((price) => price > 0);
+    if (activePrices.length > 1) {
+      const spread = Math.max(...activePrices) / Math.min(...activePrices);
+      if (spread > MAX_ACTIVE_POOL_PRICE_SPREAD) return null;
+    }
+  }
   return pairs.sort((a, b) => num(b.liquidity?.usd) - num(a.liquidity?.usd))[0] || null;
 }
 
@@ -576,7 +604,7 @@ function reviewSolanaSafety(data) {
 function passesMarketSafety(review) {
   if (!review || !Number.isFinite(review.marketCap) || review.marketCap <= 0) return false;
   if (review.liquidity < MIN_LIQUIDITY) return false;
-  if (review.liquidity / review.marketCap < 0.01) return false;
+  if (review.liquidity / review.marketCap < MIN_LIQUIDITY_TO_MARKET_CAP) return false;
   if (review.changeM5 < MAX_5M_DROP_PCT || review.changeH1 < MAX_1H_DROP_PCT) return false;
   if (review.sells > 0 && review.buys / review.sells < MIN_BUY_SELL_RATIO) return false;
   return true;
