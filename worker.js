@@ -1,4 +1,5 @@
 const CHANNEL = "SeekrTrending";
+const BUILD_ID = "pool-proof-v2-2026-09-24";
 const MAX_MARKET_CAP = 3_000_000;
 const MIN_LIQUIDITY = 10_000;
 const MIN_SCORE = 1;
@@ -50,6 +51,7 @@ export default {
     }
     return Response.json({
       status: "Seekr + Raydium + Robinhood Chain + BNB Chain tracker online",
+      build: BUILD_ID,
       schedule: "Every 3 minutes, 5:00 a.m.–8:00 p.m. Pacific",
       configured: Boolean(env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID && env.STATE),
       robinhoodConfigured: Boolean(env.BITQUERY_TOKEN),
@@ -127,7 +129,7 @@ async function scan(env) {
       const review = confirmation.review;
       const safety = await getSolanaSafety(call.contract);
       if (safety.passed && confirmation.passed && review.score >= MIN_SCORE && review.marketCap <= MAX_MARKET_CAP) {
-        await sendTelegram(env, formatAlert(call, confirmation.pair, { ...review, safety }));
+        await sendTelegram(env, formatAlert(call, confirmation.pair, { ...review, safety, confirmation }));
         results.push({ contract: call.contract, alerted: true, score: review.score, safety: safety.summary });
       } else {
         results.push({ contract: call.contract, alerted: false, score: review.score, safety: safety.summary, marketGate: confirmation.summary });
@@ -142,9 +144,9 @@ async function scan(env) {
   const robinhood = await scanRobinhood(env);
   const bnb = await scanBnb(env);
   if (connected) {
-    await sendTelegram(env, "✅ Seekr + Raydium + Robinhood Chain + BNB Chain tracker connected. Scanning every 3 minutes from 5:00 a.m. to 8:00 p.m. Pacific.");
+    await sendTelegram(env, `✅ Seekr + Raydium + Robinhood Chain + BNB Chain tracker connected. Build: <code>${BUILD_ID}</code>. Scanning every 3 minutes from 5:00 a.m. to 8:00 p.m. Pacific.`);
   }
-  return { ok: true, seekrChecked: fresh.length, seekrResults: results, raydium, robinhood, bnb };
+  return { ok: true, build: BUILD_ID, seekrChecked: fresh.length, seekrResults: results, raydium, robinhood, bnb };
 }
 
 async function scanBnb(env) {
@@ -178,7 +180,7 @@ async function scanBnb(env) {
         const confirmation = await confirmMarketMomentum(call, pair, { chainId: BNB_CHAIN_ID, chainName: "BNB Chain" });
         const review = confirmation.review;
         if (pair && safety.passed && confirmation.passed && review.score >= BNB_MIN_SCORE && review.marketCap <= MAX_MARKET_CAP) {
-          await sendTelegram(env, formatAlert(call, confirmation.pair, { ...review, safety }));
+          await sendTelegram(env, formatAlert(call, confirmation.pair, { ...review, safety, confirmation }));
           savedAlerted.add(key);
           watch.delete(key);
           results.push({ contract: item.contract, alerted: true, score: review.score, safety: safety.summary });
@@ -312,7 +314,7 @@ async function scanRobinhood(env) {
         const confirmation = await confirmMarketMomentum(call, pair, { chainId: ROBINHOOD_CHAIN_ID, chainName: "Robinhood Chain" });
         const review = confirmation.review;
         if (pair && confirmation.passed && review.score >= ROBINHOOD_MIN_SCORE && review.marketCap <= MAX_MARKET_CAP) {
-          await sendTelegram(env, formatAlert(call, confirmation.pair, review));
+          await sendTelegram(env, formatAlert(call, confirmation.pair, { ...review, confirmation }));
           savedAlerted.add(key);
           watch.delete(key);
           results.push({ contract: item.contract, alerted: true, score: review.score });
@@ -420,7 +422,7 @@ async function scanRaydium(env) {
         const review = confirmation.review;
         const safety = await getSolanaSafety(call.contract);
         if (pair && safety.passed && confirmation.passed && review.score >= MIN_SCORE && review.marketCap <= MAX_MARKET_CAP) {
-          await sendTelegram(env, formatAlert(call, confirmation.pair, { ...review, safety }));
+          await sendTelegram(env, formatAlert(call, confirmation.pair, { ...review, safety, confirmation }));
           results.push({ contract: call.contract, alerted: true, score: review.score, safety: safety.summary });
         } else {
           results.push({ contract: call.contract, alerted: false, score: review.score, safety: safety.summary, marketGate: confirmation.summary });
@@ -615,7 +617,7 @@ async function confirmMarketMomentum(call, initialPair, options = {}) {
   const chainName = options.chainName || "Solana";
   const initialReview = scorePair(call, initialPair, chainName);
   if (!passesMarketSafety(initialReview)) {
-    return { passed: false, pair: initialPair, review: initialReview, summary: "blocked by initial momentum gate" };
+    return { passed: false, pair: initialPair, review: initialReview, initialReview, summary: "blocked by initial momentum gate" };
   }
 
   // A candidate must remain healthy across two observations before Telegram receives it.
@@ -623,7 +625,15 @@ async function confirmMarketMomentum(call, initialPair, options = {}) {
   const freshPair = await getBestPair(call.contract, options.dexId || null, chainId);
   const freshReview = scorePair(call, freshPair, chainName);
   if (!passesMarketSafety(freshReview)) {
-    return { passed: false, pair: freshPair, review: freshReview, summary: "blocked by final momentum gate" };
+    return { passed: false, pair: freshPair, review: freshReview, initialReview, summary: "blocked by final momentum gate" };
+  }
+
+  // Never confirm a token by silently switching to a different pool. A pool
+  // migration, spoof pool, or fragmented launch must be reviewed separately.
+  const initialPool = String(initialPair?.pairAddress || "").toLowerCase();
+  const freshPool = String(freshPair?.pairAddress || "").toLowerCase();
+  if (!initialPool || initialPool !== freshPool) {
+    return { passed: false, pair: freshPair, review: freshReview, initialReview, summary: "blocked: selected pool changed during confirmation" };
   }
 
   const initialPrice = num(initialPair?.priceUsd);
@@ -633,10 +643,10 @@ async function confirmMarketMomentum(call, initialPair, options = {}) {
     ? ((initialReview.liquidity - freshReview.liquidity) / initialReview.liquidity) * 100
     : 0;
   if (priceDropPct > MAX_CONFIRM_PRICE_DROP_PCT || liquidityDropPct > MAX_CONFIRM_LIQUIDITY_DROP_PCT) {
-    return { passed: false, pair: freshPair, review: freshReview, summary: "blocked: price or liquidity deteriorated during confirmation" };
+    return { passed: false, pair: freshPair, review: freshReview, initialReview, priceDropPct, liquidityDropPct, summary: "blocked: price or liquidity deteriorated during confirmation" };
   }
 
-  return { passed: true, pair: freshPair, review: freshReview, summary: "passed two-observation momentum confirmation" };
+  return { passed: true, pair: freshPair, review: freshReview, initialReview, priceDropPct, liquidityDropPct, summary: "passed two-observation momentum confirmation" };
 }
 
 function scorePair(call, pair, chainName = "Solana") {
@@ -670,8 +680,13 @@ function formatAlert(call, pair, r) {
   const link = pair?.url || `https://dexscreener.com/${chainPath}/${call.contract}`;
 
   const source = call.source === "RAYDIUM" ? "RAYDIUM" : call.source === "ROBINHOOD" ? "ROBINHOOD CHAIN" : call.source === "BNB" ? "BNB CHAIN" : "SEEKR";
+  const first = r.confirmation?.initialReview;
+  const poolAddress = String(pair?.pairAddress || "unknown");
+  const poolLabel = poolAddress === "unknown" ? poolAddress : `${poolAddress.slice(0, 6)}…${poolAddress.slice(-6)}`;
   const lines = [
     `🚨 <b>${source} CANDIDATE — ${esc(call.name)}</b>`,
+    `Build: <code>${BUILD_ID}</code>`,
+    `Pool: ${esc(String(pair?.dexId || "unknown"))} / <code>${esc(poolLabel)}</code>`,
     `Score: <b>${r.score}/9</b>`,
     `Market cap: <b>${usd(r.marketCap)}</b>`,
     `Liquidity: ${usd(r.liquidity)}`,
@@ -680,6 +695,12 @@ function formatAlert(call, pair, r) {
     `1h buys/sells: ${r.buys}/${r.sells}`,
     `Why: ${esc(r.reasons.join(", "))}`,
   ];
+  if (first) {
+    lines.push(
+      `20s recheck: market cap ${usd(num(first.marketCap))} → ${usd(r.marketCap)}; liquidity ${usd(num(first.liquidity))} → ${usd(r.liquidity)}`,
+      `Recheck result: ${esc(r.confirmation.summary)}`,
+    );
+  }
   if (r.safety) lines.push(`Safety: ${esc(r.safety.summary)}`);
   lines.push(`CA: <a href="${link}">${call.contract}</a>`, "⚠️ Preliminary alert only—verify holders, insiders, bundlers and socials before risking money.");
   return lines.join("\n");
