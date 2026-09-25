@@ -1,6 +1,7 @@
 const CHANNEL = "SeekrTrending";
-const BUILD_ID = "balanced-safety-v5-2026-09-24";
+const BUILD_ID = "balanced-safety-v6-2026-09-25";
 const MAX_MARKET_CAP = 3_000_000;
+const MAX_PUMPSWAP_MARKET_CAP = 2_000_000;
 const MIN_LIQUIDITY = 10_000;
 const MIN_SCORE = 1;
 const FINAL_CONFIRM_DELAY_MS = 20_000;
@@ -26,6 +27,12 @@ const MIN_MATERIAL_UNLOCKED_POOL_USD = 2_000;
 const MIN_MATERIAL_UNLOCKED_POOL_RATIO = 0.02;
 const MAX_CREATOR_HOLDINGS_PCT = 5;
 const MAX_SUSPICIOUS_HOLDERS = 0;
+const PUMPSWAP_MIN_H1_VOLUME = 5_000;
+const PUMPSWAP_MIN_H1_BUYS = 20;
+const PUMPSWAP_MIN_H1_BUYERS = 15;
+const PUMPSWAP_MIN_BUY_SELL_RATIO = 1.1;
+const PUMPSWAP_MIN_MOMENTUM_PCT = 8;
+const PUMPSWAP_ALERT_COOLDOWN_MS = 12 * 60 * 60 * 1000;
 
 const BITQUERY_URL = "https://streaming.bitquery.io/graphql";
 const ROBINHOOD_CHAIN_ID = "robinhood";
@@ -52,7 +59,7 @@ export default {
       return Response.json(result);
     }
     return Response.json({
-      status: "Seekr + Raydium + Robinhood Chain + BNB Chain tracker online",
+      status: "Seekr + Raydium + PumpSwap momentum + Robinhood Chain + BNB Chain tracker online",
       build: BUILD_ID,
       schedule: "Every 3 minutes, 5:00 a.m.–8:00 p.m. Pacific",
       configured: Boolean(env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID && env.STATE),
@@ -144,12 +151,93 @@ async function scan(env) {
 
   if (newestId > lastId) await statePut(env, newestId);
   const raydium = await scanRaydium(env);
+  const pumpSwap = await scanPumpSwapMomentum(env);
   const robinhood = await scanRobinhood(env);
   const bnb = await scanBnb(env);
   if (connected) {
-    await sendTelegram(env, `✅ Seekr + Raydium + Robinhood Chain + BNB Chain tracker connected. Build: <code>${BUILD_ID}</code>. Scanning every 3 minutes from 5:00 a.m. to 8:00 p.m. Pacific.`);
+    await sendTelegram(env, `✅ Seekr + Raydium + PumpSwap momentum + Robinhood Chain + BNB Chain tracker connected. Build: <code>${BUILD_ID}</code>. Scanning every 3 minutes from 5:00 a.m. to 8:00 p.m. Pacific.`);
   }
-  return { ok: true, build: BUILD_ID, seekrChecked: fresh.length, seekrResults: results, raydium, robinhood, bnb };
+  return { ok: true, build: BUILD_ID, seekrChecked: fresh.length, seekrResults: results, raydium, pumpSwap, robinhood, bnb };
+}
+
+async function scanPumpSwapMomentum(env) {
+  try {
+    const payloads = await Promise.all([1, 2].map((page) =>
+      fetch(`https://api.geckoterminal.com/api/v2/networks/solana/trending_pools?include=base_token&page=${page}`, {
+        headers: { "User-Agent": "SeekrPumpSwapMomentum/1.0", Accept: "application/json" },
+      }).then(check).then((response) => response.json())
+    ));
+    const tokens = new Map();
+    for (const payload of payloads) {
+      const included = new Map((payload?.included || []).map((item) => [item.id, item?.attributes || {}]));
+      for (const pool of payload?.data || []) {
+        if (String(pool?.relationships?.dex?.data?.id || "").toLowerCase() !== "pumpswap") continue;
+        const attributes = pool?.attributes || {};
+        const marketCap = num(attributes.market_cap_usd) || num(attributes.fdv_usd);
+        const liquidity = num(attributes.reserve_in_usd);
+        const h1 = attributes?.transactions?.h1 || {};
+        const buys = num(h1.buys);
+        const sells = num(h1.sells);
+        const buyers = num(h1.buyers);
+        const volumeH1 = num(attributes?.volume_usd?.h1);
+        const changeM5 = num(attributes?.price_change_percentage?.m5);
+        const changeH1 = num(attributes?.price_change_percentage?.h1);
+        const changeH6 = num(attributes?.price_change_percentage?.h6);
+        const momentum = Math.max(changeM5, changeH1, changeH6);
+        if (marketCap <= 0 || marketCap > MAX_PUMPSWAP_MARKET_CAP) continue;
+        if (liquidity < MIN_LIQUIDITY || volumeH1 < PUMPSWAP_MIN_H1_VOLUME) continue;
+        if (buys < PUMPSWAP_MIN_H1_BUYS || buyers < PUMPSWAP_MIN_H1_BUYERS) continue;
+        if (buys / Math.max(1, sells) < PUMPSWAP_MIN_BUY_SELL_RATIO || momentum < PUMPSWAP_MIN_MOMENTUM_PCT) continue;
+        const tokenId = String(pool?.relationships?.base_token?.data?.id || "");
+        const token = included.get(tokenId) || {};
+        const contract = String(token.address || tokenId.replace(/^solana_/, ""));
+        if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(contract)) continue;
+        const existing = tokens.get(contract);
+        if (!existing || volumeH1 > existing.volumeH1) {
+          tokens.set(contract, {
+            contract,
+            name: token.name || token.symbol || attributes.name || "PumpSwap token",
+            paid: false,
+            source: "PUMPSWAP",
+            volumeH1,
+            momentum,
+          });
+        }
+      }
+    }
+
+    const now = Date.now();
+    const recentAlerts = parseJsonArray(await stateGet(env, "pumpswap_alerted"))
+      .filter((item) => item?.contract && now - num(item.alertedAt) < PUMPSWAP_ALERT_COOLDOWN_MS);
+    const lastAlert = new Map(recentAlerts.map((item) => [String(item.contract), num(item.alertedAt)]));
+    const candidates = [...tokens.values()]
+      .filter((item) => !lastAlert.has(item.contract))
+      .sort((a, b) => b.volumeH1 - a.volumeH1)
+      .slice(0, 5);
+    const results = [];
+    for (const call of candidates) {
+      try {
+        const pair = await getBestPair(call.contract, "pumpswap");
+        const confirmation = await confirmMarketMomentum(call, pair, { dexId: "pumpswap" });
+        const review = confirmation.review;
+        const safety = await getSolanaSafety(call.contract);
+        const effectiveScore = review.score - num(safety.scorePenalty);
+        if (pair && safety.passed && confirmation.passed && effectiveScore >= MIN_SCORE && review.marketCap <= MAX_PUMPSWAP_MARKET_CAP) {
+          await sendTelegram(env, formatAlert(call, confirmation.pair, { ...review, score: effectiveScore, safety, confirmation }));
+          recentAlerts.push({ contract: call.contract, alertedAt: now });
+          results.push({ contract: call.contract, alerted: true, score: effectiveScore, rawScore: review.score, safety: safety.summary });
+        } else {
+          results.push({ contract: call.contract, alerted: false, score: effectiveScore, rawScore: review.score, safety: safety.summary, marketGate: confirmation.summary });
+        }
+      } catch (error) {
+        results.push({ contract: call.contract, error: String(error) });
+      }
+    }
+    await statePut(env, JSON.stringify(recentAlerts.slice(-300)), "pumpswap_alerted");
+    return { discovered: tokens.size, checked: candidates.length, results };
+  } catch (error) {
+    return { discovered: 0, checked: 0, error: String(error) };
+  }
 }
 
 async function scanBnb(env) {
@@ -712,7 +800,7 @@ function formatAlert(call, pair, r) {
   const chainPath = call.source === "ROBINHOOD" ? "robinhood" : call.source === "BNB" ? "bsc" : "solana";
   const link = pair?.url || `https://dexscreener.com/${chainPath}/${call.contract}`;
 
-  const source = call.source === "RAYDIUM" ? "RAYDIUM" : call.source === "ROBINHOOD" ? "ROBINHOOD CHAIN" : call.source === "BNB" ? "BNB CHAIN" : "SEEKR";
+  const source = call.source === "RAYDIUM" ? "RAYDIUM" : call.source === "PUMPSWAP" ? "PUMPSWAP RESURGENCE" : call.source === "ROBINHOOD" ? "ROBINHOOD CHAIN" : call.source === "BNB" ? "BNB CHAIN" : "SEEKR";
   const first = r.confirmation?.initialReview;
   const poolAddress = String(pair?.pairAddress || "unknown");
   const poolLabel = poolAddress === "unknown" ? poolAddress : `${poolAddress.slice(0, 6)}…${poolAddress.slice(-6)}`;
