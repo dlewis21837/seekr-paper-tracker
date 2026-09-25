@@ -1,5 +1,5 @@
 const CHANNEL = "SeekrTrending";
-const BUILD_ID = "solana-feed-fallback-v10-2026-09-25";
+const BUILD_ID = "raydium-trending-v11-2026-09-25";
 const MAX_MARKET_CAP = 3_000_000;
 const MAX_PUMPSWAP_MARKET_CAP = 2_000_000;
 const MIN_LIQUIDITY = 10_000;
@@ -162,7 +162,6 @@ async function scan(env) {
   }
 
   if (newestId > lastId) await statePut(env, newestId);
-  const raydium = await scanRaydium(env);
   const solanaMomentum = await scanSolanaMomentum(env);
   const robinhood = await scanRobinhood(env);
   const bnb = await scanBnb(env);
@@ -170,7 +169,7 @@ async function scan(env) {
   if (connected) {
     await sendTelegram(env, `✅ Seekr + Raydium + PumpSwap + Meteora momentum + Robinhood Chain + BNB Chain tracker connected. Build: <code>${BUILD_ID}</code>. Scanning every 3 minutes from 5:00 a.m. to 8:00 p.m. Pacific.`);
   }
-  return { ok: true, build: BUILD_ID, seekrChecked: fresh.length, seekrResults: results, raydium, ...solanaMomentum, robinhood, bnb, learning };
+  return { ok: true, build: BUILD_ID, seekrChecked: fresh.length, seekrResults: results, ...solanaMomentum, robinhood, bnb, learning };
 }
 
 async function fetchJsonWithRetry(url, options = {}, attempts = 3) {
@@ -229,7 +228,7 @@ async function getSolanaMomentumPayloads() {
       const quote = String(pair?.quoteToken?.address || "");
       if (!addresses.includes(contract) || !TRUSTED_SOLANA_QUOTES.has(quote)) continue;
       const dexId = String(pair?.dexId || "").toLowerCase();
-      if (dexId !== "pumpswap" && dexId !== "meteora") continue;
+      if (!["pumpswap", "meteora", "raydium"].includes(dexId)) continue;
       const tokenId = `solana_${contract}`;
       included.set(tokenId, {
         id: tokenId,
@@ -271,6 +270,11 @@ async function scanSolanaMomentum(env) {
       .filter((item, index, all) => all.findIndex((other) => other.contract === item.contract) === index);
     // Run sequentially against shared history so the same token cannot alert once
     // from PumpSwap and again from Meteora during a single scheduled scan.
+    const raydium = await processSolanaMomentumDex(env, payloads, {
+      dexId: "raydium",
+      source: "RAYDIUM",
+      fallbackName: "Raydium token",
+    }, alertHistory, now);
     const pumpSwap = await processSolanaMomentumDex(env, payloads, {
       dexId: "pumpswap",
       source: "PUMPSWAP",
@@ -282,7 +286,7 @@ async function scanSolanaMomentum(env) {
       fallbackName: "Meteora token",
     }, alertHistory, now);
     await statePut(env, JSON.stringify(alertHistory.slice(-300)), "solana_momentum_alerted");
-    return { pumpSwap, meteora };
+    return { raydium, pumpSwap, meteora };
   } catch (error) {
     const failure = { discovered: 0, checked: 0, error: String(error) };
     return { pumpSwap: failure, meteora: failure };
