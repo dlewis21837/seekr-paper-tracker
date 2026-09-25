@@ -269,7 +269,7 @@ async function scanSolanaMomentum(env) {
       .filter((item) => item?.contract && now - num(item.alertedAt) < PUMPSWAP_ALERT_COOLDOWN_MS)
       .filter((item, index, all) => all.findIndex((other) => other.contract === item.contract) === index);
     // Run sequentially against shared history so the same token cannot alert once
-    // from PumpSwap and again from Meteora during a single scheduled scan.
+    // from Raydium, PumpSwap, and Meteora during a single scheduled scan.
     const raydium = await processSolanaMomentumDex(env, payloads, {
       dexId: "raydium",
       source: "RAYDIUM",
@@ -289,7 +289,7 @@ async function scanSolanaMomentum(env) {
     return { raydium, pumpSwap, meteora };
   } catch (error) {
     const failure = { discovered: 0, checked: 0, error: String(error) };
-    return { pumpSwap: failure, meteora: failure };
+    return { raydium: failure, pumpSwap: failure, meteora: failure };
   }
 }
 
