@@ -1,5 +1,5 @@
 const CHANNEL = "SeekrTrending";
-const BUILD_ID = "balanced-safety-v8-2026-09-25";
+const BUILD_ID = "meteora-safe-discovery-v9-2026-09-25";
 const MAX_MARKET_CAP = 3_000_000;
 const MAX_PUMPSWAP_MARKET_CAP = 2_000_000;
 const MIN_LIQUIDITY = 10_000;
@@ -66,7 +66,7 @@ export default {
       return Response.json(buildLearningReport(records));
     }
     return Response.json({
-      status: "Seekr + Raydium + PumpSwap momentum + Robinhood Chain + BNB Chain tracker online",
+      status: "Seekr + Raydium + PumpSwap + Meteora momentum + Robinhood Chain + BNB Chain tracker online",
       build: BUILD_ID,
       schedule: "Every 3 minutes, 5:00 a.m.–8:00 p.m. Pacific",
       configured: Boolean(env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID && env.STATE),
@@ -163,28 +163,64 @@ async function scan(env) {
 
   if (newestId > lastId) await statePut(env, newestId);
   const raydium = await scanRaydium(env);
-  const pumpSwap = await scanPumpSwapMomentum(env);
+  const solanaMomentum = await scanSolanaMomentum(env);
   const robinhood = await scanRobinhood(env);
   const bnb = await scanBnb(env);
   const learning = await updateLearningOutcomes(env).catch((error) => ({ error: String(error) }));
   if (connected) {
-    await sendTelegram(env, `✅ Seekr + Raydium + PumpSwap momentum + Robinhood Chain + BNB Chain tracker connected. Build: <code>${BUILD_ID}</code>. Scanning every 3 minutes from 5:00 a.m. to 8:00 p.m. Pacific.`);
+    await sendTelegram(env, `✅ Seekr + Raydium + PumpSwap + Meteora momentum + Robinhood Chain + BNB Chain tracker connected. Build: <code>${BUILD_ID}</code>. Scanning every 3 minutes from 5:00 a.m. to 8:00 p.m. Pacific.`);
   }
-  return { ok: true, build: BUILD_ID, seekrChecked: fresh.length, seekrResults: results, raydium, pumpSwap, robinhood, bnb, learning };
+  return { ok: true, build: BUILD_ID, seekrChecked: fresh.length, seekrResults: results, raydium, ...solanaMomentum, robinhood, bnb, learning };
 }
 
-async function scanPumpSwapMomentum(env) {
+async function scanSolanaMomentum(env) {
   try {
     const payloads = await Promise.all([1, 2].map((page) =>
       fetch(`https://api.geckoterminal.com/api/v2/networks/solana/trending_pools?include=base_token&page=${page}`, {
-        headers: { "User-Agent": "SeekrPumpSwapMomentum/1.0", Accept: "application/json" },
+        headers: { "User-Agent": "SeekrSolanaMomentum/1.0", Accept: "application/json" },
       }).then(check).then((response) => response.json())
     ));
+    const now = Date.now();
+    const currentAlerts = parseJsonArray(await stateGet(env, "solana_momentum_alerted"));
+    const legacyPumpSwapAlerts = parseJsonArray(await stateGet(env, "pumpswap_alerted"));
+    const alertHistory = [...currentAlerts, ...legacyPumpSwapAlerts]
+      .filter((item) => item?.contract && now - num(item.alertedAt) < PUMPSWAP_ALERT_COOLDOWN_MS)
+      .filter((item, index, all) => all.findIndex((other) => other.contract === item.contract) === index);
+    // Run sequentially against shared history so the same token cannot alert once
+    // from PumpSwap and again from Meteora during a single scheduled scan.
+    const pumpSwap = await processSolanaMomentumDex(env, payloads, {
+      dexId: "pumpswap",
+      source: "PUMPSWAP",
+      fallbackName: "PumpSwap token",
+    }, alertHistory, now);
+    const meteora = await processSolanaMomentumDex(env, payloads, {
+      dexId: "meteora",
+      source: "METEORA",
+      fallbackName: "Meteora token",
+    }, alertHistory, now);
+    await statePut(env, JSON.stringify(alertHistory.slice(-300)), "solana_momentum_alerted");
+    return { pumpSwap, meteora };
+  } catch (error) {
+    const failure = { discovered: 0, checked: 0, error: String(error) };
+    return { pumpSwap: failure, meteora: failure };
+  }
+}
+
+async function processSolanaMomentumDex(env, payloads, config, alertHistory, now) {
+  try {
     const tokens = new Map();
     for (const payload of payloads) {
       const included = new Map((payload?.included || []).map((item) => [item.id, item?.attributes || {}]));
       for (const pool of payload?.data || []) {
-        if (String(pool?.relationships?.dex?.data?.id || "").toLowerCase() !== "pumpswap") continue;
+        const discoveredDexId = String(pool?.relationships?.dex?.data?.id || "").toLowerCase();
+        const quoteId = String(pool?.relationships?.quote_token?.data?.id || "").replace(/^solana_/, "");
+        const trustedQuote = TRUSTED_SOLANA_QUOTES.has(quoteId);
+        const directDiscovery = discoveredDexId === config.dexId && trustedQuote;
+        // A PumpSwap token-to-token pool may nominate a token for Meteora review,
+        // but it can never validate the alert. getBestPair below must still find
+        // a separate Meteora SOL/USDC/USDT pool and confirm it twice.
+        const pumpSwapLeadForMeteora = config.dexId === "meteora" && discoveredDexId === "pumpswap";
+        if (!directDiscovery && !pumpSwapLeadForMeteora) continue;
         const attributes = pool?.attributes || {};
         const marketCap = num(attributes.market_cap_usd) || num(attributes.fdv_usd);
         const liquidity = num(attributes.reserve_in_usd);
@@ -209,9 +245,9 @@ async function scanPumpSwapMomentum(env) {
         if (!existing || volumeH1 > existing.volumeH1) {
           tokens.set(contract, {
             contract,
-            name: token.name || token.symbol || attributes.name || "PumpSwap token",
+            name: token.name || token.symbol || attributes.name || config.fallbackName,
             paid: false,
-            source: "PUMPSWAP",
+            source: config.source,
             volumeH1,
             momentum,
           });
@@ -219,10 +255,7 @@ async function scanPumpSwapMomentum(env) {
       }
     }
 
-    const now = Date.now();
-    const recentAlerts = parseJsonArray(await stateGet(env, "pumpswap_alerted"))
-      .filter((item) => item?.contract && now - num(item.alertedAt) < PUMPSWAP_ALERT_COOLDOWN_MS);
-    const lastAlert = new Map(recentAlerts.map((item) => [String(item.contract), num(item.alertedAt)]));
+    const lastAlert = new Map(alertHistory.map((item) => [String(item.contract), num(item.alertedAt)]));
     const candidates = [...tokens.values()]
       .filter((item) => !lastAlert.has(item.contract))
       .sort((a, b) => b.volumeH1 - a.volumeH1)
@@ -230,15 +263,15 @@ async function scanPumpSwapMomentum(env) {
     const results = [];
     for (const call of candidates) {
       try {
-        const pair = await getBestPair(call.contract, "pumpswap");
-        const confirmation = await confirmMarketMomentum(call, pair, { dexId: "pumpswap" });
+        const pair = await getBestPair(call.contract, config.dexId);
+        const confirmation = await confirmMarketMomentum(call, pair, { dexId: config.dexId });
         const review = confirmation.review;
         const safety = await getSolanaSafety(call.contract);
         const effectiveScore = review.score - num(safety.scorePenalty);
         const alerted = Boolean(pair && safety.passed && confirmation.passed && effectiveScore >= MIN_SCORE && review.marketCap <= MAX_PUMPSWAP_MARKET_CAP);
         if (alerted) {
           await sendTelegram(env, formatAlert(call, confirmation.pair, { ...review, score: effectiveScore, safety, confirmation }));
-          recentAlerts.push({ contract: call.contract, alertedAt: now });
+          alertHistory.push({ contract: call.contract, alertedAt: now });
           results.push({ contract: call.contract, alerted: true, score: effectiveScore, rawScore: review.score, safety: safety.summary });
         } else {
           results.push({ contract: call.contract, alerted: false, score: effectiveScore, rawScore: review.score, safety: safety.summary, marketGate: confirmation.summary });
@@ -248,7 +281,6 @@ async function scanPumpSwapMomentum(env) {
         results.push({ contract: call.contract, error: String(error) });
       }
     }
-    await statePut(env, JSON.stringify(recentAlerts.slice(-300)), "pumpswap_alerted");
     return { discovered: tokens.size, checked: candidates.length, results };
   } catch (error) {
     return { discovered: 0, checked: 0, error: String(error) };
