@@ -964,7 +964,11 @@ function reviewSolanaSafety(data) {
   if (insiderPct > MAX_INSIDER_HOLDINGS_PCT) blockers.push(`known insiders hold ${insiderPct.toFixed(1)}%`);
   if (creatorPct > MAX_CREATOR_HOLDINGS_PCT) blockers.push(`creator/developer holds ${creatorPct.toFixed(1)}%`);
   if (suspiciousHolders.length > MAX_SUSPICIOUS_HOLDERS) blockers.push(`${suspiciousHolders.length} suspicious bundled/sniper/insider top holder(s)`);
-  // Secondary unlocked pools are common after migrations. Surface them as a\n  // prominent warning, but do not reject an otherwise safe candidate solely for this.\n  const secondaryPoolWarnings = materialUnlockedPools.length\n    ? [`${materialUnlockedPools.length} material unlocked secondary pool(s)`]\n    : [];
+  // Secondary unlocked pools are common after migrations. Surface them as a
+  // prominent warning, but do not reject an otherwise safe candidate solely for this.
+  const secondaryPoolWarnings = materialUnlockedPools.length
+    ? [`${materialUnlockedPools.length} material unlocked secondary pool(s)`]
+    : [];
   blockers.push(...priorRugRisks.slice(0, 3));
   blockers.push(...dangerousRisks.slice(0, 3));
   blockers.push(...bundleRisks.slice(0, 3));
