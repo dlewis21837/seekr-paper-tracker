@@ -1,5 +1,5 @@
 const CHANNEL = "SeekrTrending";
-const BUILD_ID = "balanced-safety-v6-2026-09-25";
+const BUILD_ID = "balanced-safety-v7-2026-09-25";
 const MAX_MARKET_CAP = 3_000_000;
 const MAX_PUMPSWAP_MARKET_CAP = 2_000_000;
 const MIN_LIQUIDITY = 10_000;
@@ -810,6 +810,7 @@ function formatAlert(call, pair, r) {
     `Pool: ${esc(String(pair?.dexId || "unknown"))} / <code>${esc(poolLabel)}</code>`,
     `Score: <b>${r.score}/9</b>`,
     `Market cap: <b>${usd(r.marketCap)}</b>`,
+    `Entry tier: <b>${marketCapTier(r.marketCap)}</b>`,
     `Liquidity: ${usd(r.liquidity)}`,
     `1h volume: ${usd(r.volumeH1)}`,
     `1h change: ${r.changeH1.toFixed(1)}%`,
@@ -855,6 +856,13 @@ function decodeHtml(value) {
 }
 
 function num(value) { const n = Number(value); return Number.isFinite(n) ? n : 0; }
+function marketCapTier(value) {
+  const marketCap = num(value);
+  if (marketCap < 500_000) return "EARLY — highest risk / highest upside";
+  if (marketCap < 1_000_000) return "BUILDING — confirmed momentum";
+  if (marketCap <= 2_000_000) return "ESTABLISHED MOMENTUM — lower multiple potential";
+  return "LATE — above PumpSwap resurgence range";
+}
 function usd(value) { return Number.isFinite(value) ? `$${Math.round(value).toLocaleString("en-US")}` : "n/a"; }
 function esc(value) { return String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
 function parseJsonArray(value) { try { const v = JSON.parse(value || "[]"); return Array.isArray(v) ? v : []; } catch { return []; } }
