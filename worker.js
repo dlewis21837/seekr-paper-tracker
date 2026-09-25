@@ -1,5 +1,5 @@
 const CHANNEL = "SeekrTrending";
-const BUILD_ID = "meteora-safe-discovery-v9-2026-09-25";
+const BUILD_ID = "solana-feed-fallback-v10-2026-09-25";
 const MAX_MARKET_CAP = 3_000_000;
 const MAX_PUMPSWAP_MARKET_CAP = 2_000_000;
 const MIN_LIQUIDITY = 10_000;
@@ -173,13 +173,96 @@ async function scan(env) {
   return { ok: true, build: BUILD_ID, seekrChecked: fresh.length, seekrResults: results, raydium, ...solanaMomentum, robinhood, bnb, learning };
 }
 
+async function fetchJsonWithRetry(url, options = {}, attempts = 3) {
+  let lastError;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      const response = await fetch(url, options);
+      if (response.ok) return response.json();
+      if (response.status !== 429 && response.status < 500) throw new Error(`HTTP ${response.status}`);
+      const retryAfter = Number(response.headers.get("retry-after"));
+      const delay = Number.isFinite(retryAfter) && retryAfter > 0
+        ? Math.min(retryAfter * 1000, 10_000)
+        : 1_000 * (2 ** attempt);
+      lastError = new Error(`HTTP ${response.status}`);
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    } catch (error) {
+      lastError = error;
+      if (attempt + 1 < attempts) await new Promise((resolve) => setTimeout(resolve, 1_000 * (2 ** attempt)));
+    }
+  }
+  throw lastError || new Error("Request failed");
+}
+
+async function getSolanaMomentumPayloads() {
+  try {
+    const payload = await fetchJsonWithRetry(
+      "https://api.geckoterminal.com/api/v2/networks/solana/trending_pools?include=base_token&page=1",
+      { headers: { "User-Agent": "SeekrSolanaMomentum/1.1", Accept: "application/json" } },
+      2
+    );
+    return { payloads: [payload], source: "geckoterminal" };
+  } catch (geckoError) {
+    const [profiles, boosts] = await Promise.all([
+      fetchJsonWithRetry("https://api.dexscreener.com/token-profiles/recent-updates/v1", {
+        headers: { "User-Agent": "SeekrSolanaMomentum/1.1", Accept: "application/json" },
+      }, 2),
+      fetchJsonWithRetry("https://api.dexscreener.com/token-boosts/latest/v1", {
+        headers: { "User-Agent": "SeekrSolanaMomentum/1.1", Accept: "application/json" },
+      }, 2),
+    ]);
+    const addresses = [...new Set([...profiles, ...boosts]
+      .filter((item) => item?.chainId === "solana")
+      .map((item) => String(item?.tokenAddress || ""))
+      .filter((address) => /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(address))
+    )].slice(0, 30);
+    if (!addresses.length) throw new Error(`GeckoTerminal unavailable (${String(geckoError)}); DexScreener fallback returned no Solana tokens`);
+    const pairs = await fetchJsonWithRetry(
+      `https://api.dexscreener.com/tokens/v1/solana/${addresses.join(",")}`,
+      { headers: { "User-Agent": "SeekrSolanaMomentum/1.1", Accept: "application/json" } },
+      2
+    );
+    const included = new Map();
+    const data = [];
+    for (const pair of Array.isArray(pairs) ? pairs : []) {
+      const contract = String(pair?.baseToken?.address || "");
+      const quote = String(pair?.quoteToken?.address || "");
+      if (!addresses.includes(contract) || !TRUSTED_SOLANA_QUOTES.has(quote)) continue;
+      const dexId = String(pair?.dexId || "").toLowerCase();
+      if (dexId !== "pumpswap" && dexId !== "meteora") continue;
+      const tokenId = `solana_${contract}`;
+      included.set(tokenId, {
+        id: tokenId,
+        type: "token",
+        attributes: { address: contract, name: pair?.baseToken?.name, symbol: pair?.baseToken?.symbol },
+      });
+      data.push({
+        id: pair?.pairAddress,
+        type: "pool",
+        attributes: {
+          market_cap_usd: pair?.marketCap,
+          fdv_usd: pair?.fdv,
+          reserve_in_usd: pair?.liquidity?.usd,
+          volume_usd: { h1: pair?.volume?.h1 },
+          transactions: { h1: { buys: pair?.txns?.h1?.buys, sells: pair?.txns?.h1?.sells } },
+          price_change_percentage: { m5: pair?.priceChange?.m5, h1: pair?.priceChange?.h1, h6: pair?.priceChange?.h6 },
+          name: pair?.baseToken?.name,
+        },
+        relationships: {
+          dex: { data: { id: dexId } },
+          base_token: { data: { id: tokenId } },
+          quote_token: { data: { id: `solana_${quote}` } },
+        },
+      });
+    }
+    return { payloads: [{ data, included: [...included.values()] }], source: "dexscreener-fallback", geckoError: String(geckoError) };
+  }
+}
+
 async function scanSolanaMomentum(env) {
   try {
-    const payloads = await Promise.all([1, 2].map((page) =>
-      fetch(`https://api.geckoterminal.com/api/v2/networks/solana/trending_pools?include=base_token&page=${page}`, {
-        headers: { "User-Agent": "SeekrSolanaMomentum/1.0", Accept: "application/json" },
-      }).then(check).then((response) => response.json())
-    ));
+    const discovery = await getSolanaMomentumPayloads();
+    const payloads = discovery.payloads;
     const now = Date.now();
     const currentAlerts = parseJsonArray(await stateGet(env, "solana_momentum_alerted"));
     const legacyPumpSwapAlerts = parseJsonArray(await stateGet(env, "pumpswap_alerted"));
@@ -235,7 +318,7 @@ async function processSolanaMomentumDex(env, payloads, config, alertHistory, now
         const momentum = Math.max(changeM5, changeH1, changeH6);
         if (marketCap <= 0 || marketCap > MAX_PUMPSWAP_MARKET_CAP) continue;
         if (liquidity < MIN_LIQUIDITY || volumeH1 < PUMPSWAP_MIN_H1_VOLUME) continue;
-        if (buys < PUMPSWAP_MIN_H1_BUYS || buyers < PUMPSWAP_MIN_H1_BUYERS) continue;
+        if (buys < PUMPSWAP_MIN_H1_BUYS || (buyers > 0 && buyers < PUMPSWAP_MIN_H1_BUYERS)) continue;
         if (buys / Math.max(1, sells) < PUMPSWAP_MIN_BUY_SELL_RATIO || momentum < PUMPSWAP_MIN_MOMENTUM_PCT) continue;
         const tokenId = String(pool?.relationships?.base_token?.data?.id || "");
         const token = included.get(tokenId) || {};
