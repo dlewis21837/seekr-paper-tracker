@@ -1,5 +1,5 @@
 const CHANNEL = "SeekrTrending";
-const BUILD_ID = "balanced-safety-v7-2026-09-25";
+const BUILD_ID = "balanced-safety-v8-2026-09-25";
 const MAX_MARKET_CAP = 3_000_000;
 const MAX_PUMPSWAP_MARKET_CAP = 2_000_000;
 const MIN_LIQUIDITY = 10_000;
@@ -33,6 +33,9 @@ const PUMPSWAP_MIN_H1_BUYERS = 15;
 const PUMPSWAP_MIN_BUY_SELL_RATIO = 1.1;
 const PUMPSWAP_MIN_MOMENTUM_PCT = 8;
 const PUMPSWAP_ALERT_COOLDOWN_MS = 12 * 60 * 60 * 1000;
+const LEARNING_UPDATE_INTERVAL_MS = 15 * 60 * 1000;
+const LEARNING_WINDOW_MS = 24 * 60 * 60 * 1000;
+const LEARNING_RECORD_LIMIT = 100;
 
 const BITQUERY_URL = "https://streaming.bitquery.io/graphql";
 const ROBINHOOD_CHAIN_ID = "robinhood";
@@ -57,6 +60,10 @@ export default {
     if (url.pathname === "/run") {
       const result = await scan(env);
       return Response.json(result);
+    }
+    if (url.pathname === "/learning") {
+      const records = parseJsonArray(await stateGet(env, "learning_records"));
+      return Response.json(buildLearningReport(records));
     }
     return Response.json({
       status: "Seekr + Raydium + PumpSwap momentum + Robinhood Chain + BNB Chain tracker online",
@@ -112,7 +119,10 @@ async function scan(env) {
   if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID || !env.STATE) {
     return { ok: false, error: "Missing Telegram secrets or STATE binding" };
   }
-  if (!insidePacificWindow()) return { ok: true, skipped: "Outside active hours" };
+  if (!insidePacificWindow()) {
+    const learning = await updateLearningOutcomes(env).catch((error) => ({ error: String(error) }));
+    return { ok: true, skipped: "Outside active hours", learning };
+  }
 
   const html = await fetch(`https://t.me/s/${CHANNEL}`, {
     headers: { "User-Agent": "Mozilla/5.0 SeekrTracker/1.0" },
@@ -138,12 +148,14 @@ async function scan(env) {
       const review = confirmation.review;
       const safety = await getSolanaSafety(call.contract);
       const effectiveScore = review.score - num(safety.scorePenalty);
-      if (safety.passed && confirmation.passed && effectiveScore >= MIN_SCORE && review.marketCap <= MAX_MARKET_CAP) {
+      const alerted = safety.passed && confirmation.passed && effectiveScore >= MIN_SCORE && review.marketCap <= MAX_MARKET_CAP;
+      if (alerted) {
         await sendTelegram(env, formatAlert(call, confirmation.pair, { ...review, score: effectiveScore, safety, confirmation }));
         results.push({ contract: call.contract, alerted: true, score: effectiveScore, rawScore: review.score, safety: safety.summary });
       } else {
         results.push({ contract: call.contract, alerted: false, score: effectiveScore, rawScore: review.score, safety: safety.summary, marketGate: confirmation.summary });
       }
+      await recordLearningObservation(env, call, review, safety, confirmation, alerted).catch(() => {});
     } catch (error) {
       results.push({ contract: call.contract, error: String(error) });
     }
@@ -154,10 +166,11 @@ async function scan(env) {
   const pumpSwap = await scanPumpSwapMomentum(env);
   const robinhood = await scanRobinhood(env);
   const bnb = await scanBnb(env);
+  const learning = await updateLearningOutcomes(env).catch((error) => ({ error: String(error) }));
   if (connected) {
     await sendTelegram(env, `✅ Seekr + Raydium + PumpSwap momentum + Robinhood Chain + BNB Chain tracker connected. Build: <code>${BUILD_ID}</code>. Scanning every 3 minutes from 5:00 a.m. to 8:00 p.m. Pacific.`);
   }
-  return { ok: true, build: BUILD_ID, seekrChecked: fresh.length, seekrResults: results, raydium, pumpSwap, robinhood, bnb };
+  return { ok: true, build: BUILD_ID, seekrChecked: fresh.length, seekrResults: results, raydium, pumpSwap, robinhood, bnb, learning };
 }
 
 async function scanPumpSwapMomentum(env) {
@@ -222,13 +235,15 @@ async function scanPumpSwapMomentum(env) {
         const review = confirmation.review;
         const safety = await getSolanaSafety(call.contract);
         const effectiveScore = review.score - num(safety.scorePenalty);
-        if (pair && safety.passed && confirmation.passed && effectiveScore >= MIN_SCORE && review.marketCap <= MAX_PUMPSWAP_MARKET_CAP) {
+        const alerted = Boolean(pair && safety.passed && confirmation.passed && effectiveScore >= MIN_SCORE && review.marketCap <= MAX_PUMPSWAP_MARKET_CAP);
+        if (alerted) {
           await sendTelegram(env, formatAlert(call, confirmation.pair, { ...review, score: effectiveScore, safety, confirmation }));
           recentAlerts.push({ contract: call.contract, alertedAt: now });
           results.push({ contract: call.contract, alerted: true, score: effectiveScore, rawScore: review.score, safety: safety.summary });
         } else {
           results.push({ contract: call.contract, alerted: false, score: effectiveScore, rawScore: review.score, safety: safety.summary, marketGate: confirmation.summary });
         }
+        await recordLearningObservation(env, call, review, safety, confirmation, alerted).catch(() => {});
       } catch (error) {
         results.push({ contract: call.contract, error: String(error) });
       }
@@ -513,12 +528,14 @@ async function scanRaydium(env) {
         const review = confirmation.review;
         const safety = await getSolanaSafety(call.contract);
         const effectiveScore = review.score - num(safety.scorePenalty);
-        if (pair && safety.passed && confirmation.passed && effectiveScore >= MIN_SCORE && review.marketCap <= MAX_MARKET_CAP) {
+        const alerted = Boolean(pair && safety.passed && confirmation.passed && effectiveScore >= MIN_SCORE && review.marketCap <= MAX_MARKET_CAP);
+        if (alerted) {
           await sendTelegram(env, formatAlert(call, confirmation.pair, { ...review, score: effectiveScore, safety, confirmation }));
           results.push({ contract: call.contract, alerted: true, score: effectiveScore, rawScore: review.score, safety: safety.summary });
         } else {
           results.push({ contract: call.contract, alerted: false, score: effectiveScore, rawScore: review.score, safety: safety.summary, marketGate: confirmation.summary });
         }
+        await recordLearningObservation(env, call, review, safety, confirmation, alerted).catch(() => {});
       } catch (error) {
         results.push({ contract: call.contract, error: String(error) });
       }
@@ -530,6 +547,142 @@ async function scanRaydium(env) {
   } catch (error) {
     return { checked: 0, error: String(error) };
   }
+}
+
+async function recordLearningObservation(env, call, review, safety, confirmation, alerted) {
+  if (!call?.contract || !Number.isFinite(review?.marketCap) || review.marketCap <= 0) return;
+  const now = Date.now();
+  const records = parseJsonArray(await stateGet(env, "learning_records"));
+  let record = records.find((item) =>
+    item?.contract === call.contract && now - num(item.entryAt) < 12 * 60 * 60 * 1000
+  );
+  const snapshot = {
+    marketCap: num(review.marketCap),
+    liquidity: num(review.liquidity),
+    volumeH1: num(review.volumeH1),
+    buys: num(review.buys),
+    sells: num(review.sells),
+  };
+  if (!record) {
+    record = {
+      id: `${call.contract}:${Math.floor(now / (12 * 60 * 60 * 1000))}`,
+      contract: call.contract,
+      name: String(call.name || "Unknown").slice(0, 80),
+      source: call.source || "SEEKR",
+      entryAt: now,
+      alerted: Boolean(alerted),
+      rawScore: num(review.score),
+      effectiveScore: num(review.score) - num(safety?.scorePenalty),
+      entry: snapshot,
+      safetyPassed: Boolean(safety?.passed),
+      safety: String(safety?.summary || "").slice(0, 240),
+      marketPassed: Boolean(confirmation?.passed),
+      marketGate: String(confirmation?.summary || "").slice(0, 160),
+      reasons: (review.reasons || []).slice(0, 6),
+      checkpoints: {},
+      minMultiple: 1,
+      maxMultiple: 1,
+      missingSamples: 0,
+      outcome: "tracking",
+    };
+    records.push(record);
+  } else if (alerted && !record.alerted) {
+    record.alerted = true;
+    record.entryAt = now;
+    record.entry = snapshot;
+    record.rawScore = num(review.score);
+    record.effectiveScore = num(review.score) - num(safety?.scorePenalty);
+    record.checkpoints = {};
+    record.minMultiple = 1;
+    record.maxMultiple = 1;
+    record.missingSamples = 0;
+    record.outcome = "tracking";
+  }
+  record.lastObservedAt = now;
+  await statePut(env, JSON.stringify(records.slice(-LEARNING_RECORD_LIMIT)), "learning_records");
+}
+
+async function updateLearningOutcomes(env) {
+  const now = Date.now();
+  const lastUpdate = num(await stateGet(env, "learning_last_update"));
+  if (now - lastUpdate < LEARNING_UPDATE_INTERVAL_MS) return { skipped: "recently updated" };
+  await statePut(env, now, "learning_last_update");
+  const records = parseJsonArray(await stateGet(env, "learning_records"));
+  const active = records.filter((record) =>
+    record?.contract && num(record.entry?.marketCap) > 0 && now - num(record.entryAt) <= LEARNING_WINDOW_MS + LEARNING_UPDATE_INTERVAL_MS
+  );
+  const contracts = [...new Set(active.map((record) => record.contract))];
+  const pairs = new Map();
+  for (let i = 0; i < contracts.length; i += 30) {
+    const batch = await getBestPairs(contracts.slice(i, i + 30), "solana");
+    for (const [contract, pair] of batch) pairs.set(contract, pair);
+  }
+  const checkpoints = [
+    ["m15", 15 * 60 * 1000],
+    ["h1", 60 * 60 * 1000],
+    ["h6", 6 * 60 * 60 * 1000],
+    ["h24", 24 * 60 * 60 * 1000],
+  ];
+  for (const record of active) {
+    const pair = pairs.get(String(record.contract).toLowerCase());
+    if (!pair) {
+      record.missingSamples = num(record.missingSamples) + 1;
+      if (record.missingSamples >= 3) record.minMultiple = 0;
+      continue;
+    }
+    record.missingSamples = 0;
+    const currentMarketCap = num(pair.marketCap) || num(pair.fdv);
+    const currentLiquidity = num(pair?.liquidity?.usd);
+    if (currentMarketCap <= 0) continue;
+    const multiple = currentMarketCap / num(record.entry.marketCap);
+    record.minMultiple = Math.min(num(record.minMultiple) || 1, multiple);
+    record.maxMultiple = Math.max(num(record.maxMultiple) || 1, multiple);
+    record.last = { at: now, marketCap: currentMarketCap, liquidity: currentLiquidity, multiple };
+    const age = now - num(record.entryAt);
+    for (const [label, delay] of checkpoints) {
+      if (age >= delay && !record.checkpoints?.[label]) {
+        record.checkpoints[label] = { at: now, marketCap: currentMarketCap, liquidity: currentLiquidity, multiple };
+      }
+    }
+    if (age >= LEARNING_WINDOW_MS) record.outcome = classifyLearningOutcome(record);
+  }
+  await statePut(env, JSON.stringify(records.slice(-LEARNING_RECORD_LIMIT)), "learning_records");
+  return { tracked: active.length, totalRecords: records.length };
+}
+
+function classifyLearningOutcome(record) {
+  const minMultiple = num(record.minMultiple);
+  const maxMultiple = num(record.maxMultiple);
+  const entryLiquidity = num(record.entry?.liquidity);
+  const lastLiquidity = num(record.last?.liquidity);
+  if (minMultiple <= 0.1 || (entryLiquidity > 0 && lastLiquidity / entryLiquidity <= 0.2)) return "rug";
+  if (minMultiple <= 0.2) return "steep_drawdown";
+  if (maxMultiple >= 3) return "runner_3x_plus";
+  if (maxMultiple >= 1.5) return "winner_1_5x_plus";
+  if (num(record.last?.multiple) >= 0.7) return "held";
+  return "faded";
+}
+
+function buildLearningReport(records) {
+  const outcomes = {};
+  let alerted = 0;
+  let rejected = 0;
+  let falseNegativeRunners = 0;
+  for (const record of records) {
+    if (record.alerted) alerted += 1;
+    else rejected += 1;
+    outcomes[record.outcome || "tracking"] = num(outcomes[record.outcome || "tracking"]) + 1;
+    if (!record.alerted && num(record.maxMultiple) >= 3) falseNegativeRunners += 1;
+  }
+  return {
+    build: BUILD_ID,
+    total: records.length,
+    alerted,
+    rejected,
+    falseNegativeRunners,
+    outcomes,
+    recent: records.slice(-25).reverse(),
+  };
 }
 
 function insidePacificWindow() {
