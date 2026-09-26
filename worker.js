@@ -1,5 +1,5 @@
 const CHANNEL = "SeekrTrending";
-const BUILD_ID = "late-pump-guard-v13-2026-09-26";
+const BUILD_ID = "momentum-safe-v14-2026-09-26";
 const MAX_MARKET_CAP = 3_000_000;
 const MAX_PUMPSWAP_MARKET_CAP = 2_000_000;
 const MIN_LIQUIDITY = 10_000;
@@ -1322,29 +1322,28 @@ function scorePair(call, pair, chainName = "Solana") {
   if (buys >= 20 && buys > sells * 1.15) { score += 1; reasons.push("buy pressure"); }
   if (changeH1 >= 5 && changeH1 <= LATE_PUMP_H1_EXTREME_PCT) { score += 1; reasons.push("positive momentum"); }
   const buySellRatio = buys / Math.max(1, sells);
+  const extendedMove = changeH6 >= LATE_PUMP_H6_EXTREME_PCT
+    || changeH1 >= LATE_PUMP_H1_WARNING_PCT;
   let latePumpPenalty = 0;
   const latePumpReasons = [];
-  if (changeH6 >= LATE_PUMP_H6_EXTREME_PCT) {
-    latePumpPenalty += 3;
-    latePumpReasons.push(`parabolic 6h move (${changeH6.toFixed(0)}%)`);
-  } else if (changeH1 >= LATE_PUMP_H1_EXTREME_PCT) {
+
+  // Momentum alone is desirable and receives no penalty. Only flag an extended
+  // move when current order flow shows that demand is deteriorating.
+  if (extendedMove && buySellRatio < LATE_PUMP_WEAK_BUY_RATIO) {
     latePumpPenalty += 2;
-    latePumpReasons.push(`extreme 1h move (${changeH1.toFixed(0)}%)`);
-  } else if (changeH1 >= LATE_PUMP_H1_WARNING_PCT) {
-    latePumpPenalty += 1;
-    latePumpReasons.push(`extended 1h move (${changeH1.toFixed(0)}%)`);
+    latePumpReasons.push(`weak follow-through after large move (${buySellRatio.toFixed(2)} buy/sell)`);
   }
-  if (latePumpPenalty > 0 && buySellRatio < LATE_PUMP_WEAK_BUY_RATIO) {
+  if (extendedMove && changeM5 < 0) {
     latePumpPenalty += 1;
-    latePumpReasons.push(`weak follow-through (${buySellRatio.toFixed(2)} buy/sell)`);
+    latePumpReasons.push(`5m momentum rolling over (${changeM5.toFixed(1)}%)`);
   }
   if (latePumpPenalty > 0 && call.paid) {
     latePumpPenalty += 1;
-    latePumpReasons.push("promotion overlaps price spike");
+    latePumpReasons.push("promotion overlaps weakening demand");
   }
   if (latePumpPenalty > 0) {
     score -= latePumpPenalty;
-    reasons.push(`late-pump risk -${latePumpPenalty}`);
+    reasons.push(`late-pump deterioration -${latePumpPenalty}`);
   }
   if (ageMinutes <= 180) { score += 1; reasons.push("very young pool"); }
   if (liquidity < MIN_LIQUIDITY) { score -= 3; reasons.push("thin liquidity"); }
