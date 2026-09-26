@@ -1,5 +1,5 @@
 const CHANNEL = "SeekrTrending";
-const BUILD_ID = "raydium-trending-v11-2026-09-25";
+const BUILD_ID = "paper-ledger-v12-2026-09-25";
 const MAX_MARKET_CAP = 3_000_000;
 const MAX_PUMPSWAP_MARKET_CAP = 2_000_000;
 const MIN_LIQUIDITY = 10_000;
@@ -36,6 +36,12 @@ const PUMPSWAP_ALERT_COOLDOWN_MS = 12 * 60 * 60 * 1000;
 const LEARNING_UPDATE_INTERVAL_MS = 15 * 60 * 1000;
 const LEARNING_WINDOW_MS = 24 * 60 * 60 * 1000;
 const LEARNING_RECORD_LIMIT = 100;
+const PAPER_ENTRY_MIN_MARKET_CAP = 150_000;
+const PAPER_ENTRY_MAX_MARKET_CAP = 180_000;
+const PAPER_STOP_MULTIPLE = 0.70;
+const PAPER_WATCH_WINDOW_MS = 24 * 60 * 60 * 1000;
+const PAPER_POSITION_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+const PAPER_RECORD_LIMIT = 300;
 
 const BITQUERY_URL = "https://streaming.bitquery.io/graphql";
 const ROBINHOOD_CHAIN_ID = "robinhood";
@@ -64,6 +70,11 @@ export default {
     if (url.pathname === "/learning") {
       const records = parseJsonArray(await stateGet(env, "learning_records"));
       return Response.json(buildLearningReport(records));
+    }
+    if (url.pathname === "/paper") {
+      const positions = parseJsonArray(await stateGet(env, "paper_positions"));
+      const watch = parseJsonArray(await stateGet(env, "paper_watch"));
+      return Response.json(buildPaperReport(positions, watch));
     }
     return Response.json({
       status: "Seekr + Raydium + PumpSwap + Meteora momentum + Robinhood Chain + BNB Chain tracker online",
@@ -121,7 +132,8 @@ async function scan(env) {
   }
   if (!insidePacificWindow()) {
     const learning = await updateLearningOutcomes(env).catch((error) => ({ error: String(error) }));
-    return { ok: true, skipped: "Outside active hours", learning };
+    const paper = await updatePaperLedger(env).catch((error) => ({ error: String(error) }));
+    return { ok: true, skipped: "Outside active hours", learning, paper };
   }
 
   const html = await fetch(`https://t.me/s/${CHANNEL}`, {
@@ -166,10 +178,12 @@ async function scan(env) {
   const robinhood = await scanRobinhood(env);
   const bnb = await scanBnb(env);
   const learning = await updateLearningOutcomes(env).catch((error) => ({ error: String(error) }));
+  const paper = await updatePaperLedger(env).catch((error) => ({ error: String(error) }));
+  await maybeSendDailyPaperReport(env, paper).catch(() => {});
   if (connected) {
     await sendTelegram(env, `✅ Seekr + Raydium + PumpSwap + Meteora momentum + Robinhood Chain + BNB Chain tracker connected. Build: <code>${BUILD_ID}</code>. Scanning every 3 minutes from 5:00 a.m. to 8:00 p.m. Pacific.`);
   }
-  return { ok: true, build: BUILD_ID, seekrChecked: fresh.length, seekrResults: results, ...solanaMomentum, robinhood, bnb, learning };
+  return { ok: true, build: BUILD_ID, seekrChecked: fresh.length, seekrResults: results, ...solanaMomentum, robinhood, bnb, learning, paper };
 }
 
 async function fetchJsonWithRetry(url, options = {}, attempts = 3) {
@@ -406,6 +420,7 @@ async function scanBnb(env) {
         const review = confirmation.review;
         if (pair && safety.passed && confirmation.passed && review.score >= BNB_MIN_SCORE && review.marketCap <= MAX_MARKET_CAP) {
           await sendTelegram(env, formatAlert(call, confirmation.pair, { ...review, safety, confirmation }));
+          await recordPaperWatch(env, call, review);
           savedAlerted.add(key);
           watch.delete(key);
           results.push({ contract: item.contract, alerted: true, score: review.score, safety: safety.summary });
@@ -540,6 +555,7 @@ async function scanRobinhood(env) {
         const review = confirmation.review;
         if (pair && confirmation.passed && review.score >= ROBINHOOD_MIN_SCORE && review.marketCap <= MAX_MARKET_CAP) {
           await sendTelegram(env, formatAlert(call, confirmation.pair, { ...review, confirmation }));
+          await recordPaperWatch(env, call, review);
           savedAlerted.add(key);
           watch.delete(key);
           results.push({ contract: item.contract, alerted: true, score: review.score });
@@ -670,6 +686,7 @@ async function scanRaydium(env) {
 
 async function recordLearningObservation(env, call, review, safety, confirmation, alerted) {
   if (!call?.contract || !Number.isFinite(review?.marketCap) || review.marketCap <= 0) return;
+  if (alerted) await recordPaperWatch(env, call, review);
   const now = Date.now();
   const records = parseJsonArray(await stateGet(env, "learning_records"));
   let record = records.find((item) =>
@@ -688,6 +705,7 @@ async function recordLearningObservation(env, call, review, safety, confirmation
       contract: call.contract,
       name: String(call.name || "Unknown").slice(0, 80),
       source: call.source || "SEEKR",
+      chainId: paperChainId(call.source),
       entryAt: now,
       alerted: Boolean(alerted),
       rawScore: num(review.score),
@@ -802,6 +820,238 @@ function buildLearningReport(records) {
     outcomes,
     recent: records.slice(-25).reverse(),
   };
+}
+
+async function recordPaperWatch(env, call, review) {
+  const now = Date.now();
+  const watch = parseJsonArray(await stateGet(env, "paper_watch"));
+  const positions = parseJsonArray(await stateGet(env, "paper_positions"));
+  let item = watch.find((record) => record?.contract === call.contract && record.status === "watching");
+  if (!item) {
+    item = {
+      contract: call.contract,
+      name: String(call.name || "Unknown").slice(0, 80),
+      source: call.source || "SEEKR",
+      chainId: paperChainId(call.source),
+      alertedAt: now,
+      alertMarketCap: num(review.marketCap),
+      lastMarketCap: num(review.marketCap),
+      status: "watching",
+    };
+    watch.push(item);
+  } else {
+    item.lastMarketCap = num(review.marketCap);
+    item.lastAlertedAt = now;
+  }
+  const chainId = paperChainId(call.source);
+  if (!positions.some((position) => position.contract === call.contract && (position.chainId || "solana") === chainId)) {
+    const marketCap = num(review.marketCap);
+    positions.push({
+      id: `${call.contract}:${now}`,
+      contract: call.contract,
+      name: String(call.name || "Unknown").slice(0, 80),
+      source: call.source || "SEEKR",
+      chainId,
+      alertedAt: now,
+      entryAt: now,
+      entryMarketCap: marketCap,
+      entryLiquidity: num(review.liquidity),
+      stopMarketCap: marketCap * PAPER_STOP_MULTIPLE,
+      targetBand: marketCap >= PAPER_ENTRY_MIN_MARKET_CAP && marketCap <= PAPER_ENTRY_MAX_MARKET_CAP,
+      status: "open",
+      currentMarketCap: marketCap,
+      currentMultiple: 1,
+      minMultiple: 1,
+      maxMultiple: 1,
+      milestones: {},
+    });
+    item.status = "entered";
+    item.enteredAt = now;
+    item.entryMarketCap = marketCap;
+  }
+  await statePut(env, JSON.stringify(watch.slice(-PAPER_RECORD_LIMIT)), "paper_watch");
+  await statePut(env, JSON.stringify(positions.slice(-PAPER_RECORD_LIMIT)), "paper_positions");
+}
+
+async function updatePaperLedger(env) {
+  const now = Date.now();
+  const watch = parseJsonArray(await stateGet(env, "paper_watch"));
+  const positions = parseJsonArray(await stateGet(env, "paper_positions"));
+  const watching = watch.filter((item) =>
+    item?.contract && item.status === "watching" && now - num(item.alertedAt) <= PAPER_WATCH_WINDOW_MS
+  );
+  const open = positions.filter((item) => item?.contract && item.status === "open");
+  const tracked = [...watching, ...open];
+  const pairs = new Map();
+  for (const chainId of [...new Set(tracked.map((item) => item.chainId || "solana"))]) {
+    const contracts = [...new Set(tracked.filter((item) => (item.chainId || "solana") === chainId).map((item) => item.contract))];
+    for (let i = 0; i < contracts.length; i += 30) {
+      const batch = await getBestPairs(contracts.slice(i, i + 30), chainId);
+      for (const [contract, pair] of batch) pairs.set(`${chainId}:${contract}`, pair);
+    }
+  }
+
+  for (const item of watching) {
+    const chainId = item.chainId || "solana";
+    const pair = pairs.get(`${chainId}:${String(item.contract).toLowerCase()}`);
+    const marketCap = num(pair?.marketCap) || num(pair?.fdv);
+    if (marketCap <= 0) continue;
+    item.previousMarketCap = num(item.lastMarketCap);
+    item.lastMarketCap = marketCap;
+    item.lastCheckedAt = now;
+    if (marketCap < PAPER_ENTRY_MIN_MARKET_CAP || marketCap > PAPER_ENTRY_MAX_MARKET_CAP) continue;
+    if (positions.some((position) => position.contract === item.contract)) {
+      item.status = "entered";
+      continue;
+    }
+    const position = {
+      id: `${item.contract}:${now}`,
+      contract: item.contract,
+      name: item.name,
+      source: item.source,
+      chainId,
+      alertedAt: item.alertedAt,
+      entryAt: now,
+      entryMarketCap: marketCap,
+      entryLiquidity: num(pair?.liquidity?.usd),
+      stopMarketCap: marketCap * PAPER_STOP_MULTIPLE,
+      targetBand: true,
+      status: "open",
+      currentMarketCap: marketCap,
+      currentMultiple: 1,
+      minMultiple: 1,
+      maxMultiple: 1,
+      milestones: {},
+    };
+    positions.push(position);
+    item.status = "entered";
+    item.enteredAt = now;
+    item.entryMarketCap = marketCap;
+  }
+
+  for (const position of positions.filter((item) => item.status === "open")) {
+    const chainId = position.chainId || "solana";
+    const pair = pairs.get(`${chainId}:${String(position.contract).toLowerCase()}`);
+    const marketCap = num(pair?.marketCap) || num(pair?.fdv);
+    if (marketCap <= 0) {
+      position.missingSamples = num(position.missingSamples) + 1;
+      if (position.missingSamples >= 3) {
+        position.status = "stopped";
+        position.closedAt = now;
+        position.exitMarketCap = 0;
+        position.exitMultiple = 0;
+      }
+      continue;
+    }
+    position.missingSamples = 0;
+    const multiple = marketCap / num(position.entryMarketCap);
+    position.currentMarketCap = marketCap;
+    position.currentMultiple = multiple;
+    position.currentLiquidity = num(pair?.liquidity?.usd);
+    position.lastCheckedAt = now;
+    position.minMultiple = Math.min(num(position.minMultiple) || 1, multiple);
+    position.maxMultiple = Math.max(num(position.maxMultiple) || 1, multiple);
+    for (const target of [1.5, 2, 3, 5, 10]) {
+      const key = `x${String(target).replace(".", "_")}`;
+      if (multiple >= target && !position.milestones[key]) {
+        position.milestones[key] = { at: now, marketCap, multiple };
+      }
+    }
+    if (multiple <= PAPER_STOP_MULTIPLE) {
+      position.status = "stopped";
+      position.closedAt = now;
+      position.exitMarketCap = marketCap;
+      position.exitMultiple = multiple;
+    } else if (now - num(position.entryAt) > PAPER_POSITION_WINDOW_MS) {
+      position.status = "expired";
+      position.closedAt = now;
+      position.exitMarketCap = marketCap;
+      position.exitMultiple = multiple;
+    }
+  }
+
+  for (const item of watch) {
+    if (item.status === "watching" && now - num(item.alertedAt) > PAPER_WATCH_WINDOW_MS) item.status = "expired";
+  }
+  const savedPositions = positions.slice(-PAPER_RECORD_LIMIT);
+  const savedWatch = watch.slice(-PAPER_RECORD_LIMIT);
+  await statePut(env, JSON.stringify(savedPositions), "paper_positions");
+  await statePut(env, JSON.stringify(savedWatch), "paper_watch");
+  return buildPaperReport(savedPositions, savedWatch);
+}
+
+function buildPaperReport(positions, watch) {
+  const open = positions.filter((item) => item.status === "open");
+  const stopped = positions.filter((item) => item.status === "stopped");
+  const hit2x = positions.filter((item) => num(item.maxMultiple) >= 2);
+  const hit3x = positions.filter((item) => num(item.maxMultiple) >= 3);
+  const stoppedBefore2x = stopped.filter((item) => num(item.maxMultiple) < 2);
+  const targetBand = positions.filter((item) => item.targetBand === true);
+  const outsideBand = positions.filter((item) => item.targetBand !== true);
+  const cohort = (items) => ({
+    entries: items.length,
+    open: items.filter((item) => item.status === "open").length,
+    stopped: items.filter((item) => item.status === "stopped").length,
+    hit2x: items.filter((item) => num(item.maxMultiple) >= 2).length,
+    hit3x: items.filter((item) => num(item.maxMultiple) >= 3).length,
+  });
+  return {
+    build: BUILD_ID,
+    rules: {
+      entryMarketCap: `$${PAPER_ENTRY_MIN_MARKET_CAP.toLocaleString("en-US")}-$${PAPER_ENTRY_MAX_MARKET_CAP.toLocaleString("en-US")}`,
+      stop: "-30%",
+      milestones: ["1.5x", "2x", "3x", "5x", "10x"],
+      watchHoursAfterAlert: PAPER_WATCH_WINDOW_MS / 3_600_000,
+    },
+    totals: {
+      watchedCalls: watch.length,
+      entries: positions.length,
+      open: open.length,
+      stopped: stopped.length,
+      stoppedBefore2x: stoppedBefore2x.length,
+      hit2x: hit2x.length,
+      hit3x: hit3x.length,
+    },
+    cohorts: {
+      target150kTo180k: cohort(targetBand),
+      allOtherEntries: cohort(outsideBand),
+    },
+    positions: positions.slice(-100).reverse(),
+  };
+}
+
+function paperChainId(source) {
+  if (source === "BNB") return BNB_CHAIN_ID;
+  if (source === "ROBINHOOD") return ROBINHOOD_CHAIN_ID;
+  return "solana";
+}
+
+async function maybeSendDailyPaperReport(env, report) {
+  if (!report?.totals) return;
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Los_Angeles",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(new Date());
+  const value = (type) => parts.find((part) => part.type === type)?.value || "";
+  if (Number(value("hour")) < 19) return;
+  const date = `${value("year")}-${value("month")}-${value("day")}`;
+  if ((await stateGet(env, "paper_daily_report_date")) === date) return;
+  const t = report.totals;
+  const band = report.cohorts?.target150kTo180k || {};
+  await sendTelegram(env, [
+    "📊 <b>DAILY PAPER LEDGER — ALL ALERTS</b>",
+    `All entries: <b>${t.entries}</b> | Open: <b>${t.open}</b>`,
+    `Hit 2×: <b>${t.hit2x}</b> | Hit 3×: <b>${t.hit3x}</b>`,
+    `Stopped at −30%: <b>${t.stopped}</b>`,
+    `Stopped before 2×: <b>${t.stoppedBefore2x}</b>`,
+    `$150K–$180K group: <b>${band.entries || 0}</b> entries, <b>${band.hit2x || 0}</b> hit 2×, <b>${band.stopped || 0}</b> stopped`,
+    "Paper tracking only—no automatic buying or selling.",
+  ].join("\n"));
+  await statePut(env, date, "paper_daily_report_date");
 }
 
 function insidePacificWindow() {
