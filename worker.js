@@ -1,5 +1,5 @@
 const CHANNEL = "SeekrTrending";
-const BUILD_ID = "paper-ledger-v12-2026-09-25";
+const BUILD_ID = "late-pump-guard-v13-2026-09-26";
 const MAX_MARKET_CAP = 3_000_000;
 const MAX_PUMPSWAP_MARKET_CAP = 2_000_000;
 const MIN_LIQUIDITY = 10_000;
@@ -14,6 +14,10 @@ const MIN_POOL_INTEGRITY_LIQUIDITY = 1_000;
 const MIN_POOL_INTEGRITY_TRADES_H1 = 10;
 const MAX_CONFIRM_PRICE_DROP_PCT = 12;
 const MAX_CONFIRM_LIQUIDITY_DROP_PCT = 20;
+const LATE_PUMP_H1_WARNING_PCT = 150;
+const LATE_PUMP_H1_EXTREME_PCT = 250;
+const LATE_PUMP_H6_EXTREME_PCT = 700;
+const LATE_PUMP_WEAK_BUY_RATIO = 1.25;
 const ROBINHOOD_MIN_SCORE = 4;
 const BNB_MIN_SCORE = 4;
 const MAX_SINGLE_HOLDER_PCT = 15;
@@ -1303,6 +1307,7 @@ function scorePair(call, pair, chainName = "Solana") {
   const volumeH1 = num(pair.volume?.h1);
   const changeM5 = num(pair.priceChange?.m5);
   const changeH1 = num(pair.priceChange?.h1);
+  const changeH6 = num(pair.priceChange?.h6);
   const buys = num(pair.txns?.h1?.buys);
   const sells = num(pair.txns?.h1?.sells);
   const ageMinutes = pair.pairCreatedAt ? (Date.now() - pair.pairCreatedAt) / 60000 : 99999;
@@ -1315,11 +1320,39 @@ function scorePair(call, pair, chainName = "Solana") {
   if (volumeH1 >= 20_000) { score += 2; reasons.push("strong 1h volume"); }
   else if (volumeH1 >= 7_500) { score += 1; reasons.push("building 1h volume"); }
   if (buys >= 20 && buys > sells * 1.15) { score += 1; reasons.push("buy pressure"); }
-  if (changeH1 >= 5 && changeH1 <= 250) { score += 1; reasons.push("positive momentum"); }
+  if (changeH1 >= 5 && changeH1 <= LATE_PUMP_H1_EXTREME_PCT) { score += 1; reasons.push("positive momentum"); }
+  const buySellRatio = buys / Math.max(1, sells);
+  let latePumpPenalty = 0;
+  const latePumpReasons = [];
+  if (changeH6 >= LATE_PUMP_H6_EXTREME_PCT) {
+    latePumpPenalty += 3;
+    latePumpReasons.push(`parabolic 6h move (${changeH6.toFixed(0)}%)`);
+  } else if (changeH1 >= LATE_PUMP_H1_EXTREME_PCT) {
+    latePumpPenalty += 2;
+    latePumpReasons.push(`extreme 1h move (${changeH1.toFixed(0)}%)`);
+  } else if (changeH1 >= LATE_PUMP_H1_WARNING_PCT) {
+    latePumpPenalty += 1;
+    latePumpReasons.push(`extended 1h move (${changeH1.toFixed(0)}%)`);
+  }
+  if (latePumpPenalty > 0 && buySellRatio < LATE_PUMP_WEAK_BUY_RATIO) {
+    latePumpPenalty += 1;
+    latePumpReasons.push(`weak follow-through (${buySellRatio.toFixed(2)} buy/sell)`);
+  }
+  if (latePumpPenalty > 0 && call.paid) {
+    latePumpPenalty += 1;
+    latePumpReasons.push("promotion overlaps price spike");
+  }
+  if (latePumpPenalty > 0) {
+    score -= latePumpPenalty;
+    reasons.push(`late-pump risk -${latePumpPenalty}`);
+  }
   if (ageMinutes <= 180) { score += 1; reasons.push("very young pool"); }
   if (liquidity < MIN_LIQUIDITY) { score -= 3; reasons.push("thin liquidity"); }
   if (call.paid) { score -= 1; reasons.push("DexScreener promotion flagged"); }
-  return { score, marketCap, liquidity, volumeH1, changeM5, changeH1, buys, sells, ageMinutes, reasons };
+  return {
+    score, marketCap, liquidity, volumeH1, changeM5, changeH1, changeH6,
+    buys, sells, ageMinutes, reasons, latePumpPenalty, latePumpReasons,
+  };
 }
 
 function formatAlert(call, pair, r) {
@@ -1340,9 +1373,13 @@ function formatAlert(call, pair, r) {
     `Liquidity: ${usd(r.liquidity)}`,
     `1h volume: ${usd(r.volumeH1)}`,
     `1h change: ${r.changeH1.toFixed(1)}%`,
+    `6h change: ${r.changeH6.toFixed(1)}%`,
     `1h buys/sells: ${r.buys}/${r.sells}`,
     `Why: ${esc(r.reasons.join(", "))}`,
   ];
+  if (r.latePumpPenalty > 0) {
+    lines.push(`⚠️ <b>LATE PUMP / PROMOTED EXIT RISK (-${r.latePumpPenalty})</b>: ${esc(r.latePumpReasons.join(", "))}`);
+  }
   if (first) {
     lines.push(
       `20s recheck: market cap ${usd(num(first.marketCap))} → ${usd(r.marketCap)}; liquidity ${usd(num(first.liquidity))} → ${usd(r.liquidity)}`,
