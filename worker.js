@@ -64,8 +64,11 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     if (url.pathname === "/run") {
-      const result = await scan(env);
+      const result = await runScan(env);
       return Response.json(result);
+    }
+    if (url.pathname === "/status") {
+      return Response.json(JSON.parse((await stateGet(env, "last_scan_status")) || "{}"));
     }
     if (url.pathname === "/learning") {
       const records = parseJsonArray(await stateGet(env, "learning_records"));
@@ -87,7 +90,7 @@ export default {
   },
 
   async scheduled(_controller, env, ctx) {
-    ctx.waitUntil(scan(env));
+    ctx.waitUntil(runScan(env));
   },
 };
 
@@ -126,13 +129,32 @@ async function statePut(env, value, key = "last_message_id") {
   await stub.fetch(`https://state/put?key=${encodeURIComponent(key)}`, { method: "POST", body: String(value) });
 }
 
+async function runScan(env) {
+  const at = new Date().toISOString();
+  try {
+    const result = await scan(env);
+    const status = { at, ok: result.ok, seekrChecked: result.seekrChecked ?? 0,
+      seekrErrors: (result.seekrResults || []).filter((item) => item.error).length,
+      sources: { raydium: result.raydium, pumpSwap: result.pumpSwap, meteora: result.meteora,
+        robinhood: result.robinhood, bnb: result.bnb }, paperError: result.paper?.error || null,
+      error: result.error || null, skipped: result.skipped || null };
+    await statePut(env, JSON.stringify(status), "last_scan_status").catch(console.error);
+    return result;
+  } catch (error) {
+    const result = { ok: false, at, error: String(error) };
+    console.error("Scan failed", error);
+    await statePut(env, JSON.stringify(result), "last_scan_status").catch(console.error);
+    return result;
+  }
+}
+
 async function scan(env) {
   if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID || !env.STATE) {
     return { ok: false, error: "Missing Telegram secrets or STATE binding" };
   }
   if (!insidePacificWindow()) {
     const learning = await updateLearningOutcomes(env).catch((error) => ({ error: String(error) }));
-    const paper = await updatePaperLedger(env).catch((error) => ({ error: String(error) }));
+    const paper = await updatePaperLedgerSafe(env);
     return { ok: true, skipped: "Outside active hours", learning, paper };
   }
 
@@ -153,12 +175,14 @@ async function scan(env) {
 
   const fresh = lastId ? calls.filter((c) => c.id > lastId).sort((a, b) => a.id - b.id) : [];
   const results = [];
+  let processedId = lastId;
   for (const call of fresh) {
     try {
       const pair = await getBestPair(call.contract);
       const confirmation = await confirmMarketMomentum(call, pair);
       const review = confirmation.review;
       const safety = await getSolanaSafety(call.contract);
+      if (safety.summary?.includes("safety report unavailable")) throw new Error(safety.summary);
       const effectiveScore = review.score - num(safety.scorePenalty);
       const alerted = safety.passed && confirmation.passed && effectiveScore >= MIN_SCORE && review.marketCap <= MAX_MARKET_CAP;
       if (alerted) {
@@ -168,17 +192,19 @@ async function scan(env) {
         results.push({ contract: call.contract, alerted: false, score: effectiveScore, rawScore: review.score, safety: safety.summary, marketGate: confirmation.summary });
       }
       await recordLearningObservation(env, call, review, safety, confirmation, alerted).catch(() => {});
+      processedId = call.id;
     } catch (error) {
       results.push({ contract: call.contract, error: String(error) });
+      break; // Keep this call pending so provider failures do not lose it.
     }
   }
 
-  if (newestId > lastId) await statePut(env, newestId);
+  if (processedId > lastId) await statePut(env, processedId);
   const solanaMomentum = await scanSolanaMomentum(env);
   const robinhood = await scanRobinhood(env);
   const bnb = await scanBnb(env);
   const learning = await updateLearningOutcomes(env).catch((error) => ({ error: String(error) }));
-  const paper = await updatePaperLedger(env).catch((error) => ({ error: String(error) }));
+  const paper = await updatePaperLedgerSafe(env);
   await maybeSendDailyPaperReport(env, paper).catch(() => {});
   if (connected) {
     await sendTelegram(env, `✅ Seekr + Raydium + PumpSwap + Meteora momentum + Robinhood Chain + BNB Chain tracker connected. Build: <code>${BUILD_ID}</code>. Scanning every 3 minutes from 5:00 a.m. to 8:00 p.m. Pacific.`);
@@ -198,7 +224,7 @@ async function fetchJsonWithRetry(url, options = {}, attempts = 3) {
         ? Math.min(retryAfter * 1000, 10_000)
         : 1_000 * (2 ** attempt);
       lastError = new Error(`HTTP ${response.status}`);
-      await new Promise((resolve) => setTimeout(resolve, delay));
+      if (attempt + 1 < attempts) await new Promise((resolve) => setTimeout(resolve, delay));
     } catch (error) {
       lastError = error;
       if (attempt + 1 < attempts) await new Promise((resolve) => setTimeout(resolve, 1_000 * (2 ** attempt)));
@@ -216,7 +242,7 @@ async function getSolanaMomentumPayloads() {
     );
     return { payloads: [payload], source: "geckoterminal" };
   } catch (geckoError) {
-    const [profiles, boosts] = await Promise.all([
+    const [profileResult, boostResult] = await Promise.allSettled([
       fetchJsonWithRetry("https://api.dexscreener.com/token-profiles/recent-updates/v1", {
         headers: { "User-Agent": "SeekrSolanaMomentum/1.1", Accept: "application/json" },
       }, 2),
@@ -224,6 +250,9 @@ async function getSolanaMomentumPayloads() {
         headers: { "User-Agent": "SeekrSolanaMomentum/1.1", Accept: "application/json" },
       }, 2),
     ]);
+    const profiles = profileResult.status === "fulfilled" ? profileResult.value : [];
+    const boosts = boostResult.status === "fulfilled" ? boostResult.value : [];
+    if (!profiles.length && !boosts.length) throw new Error(`All Solana discovery providers failed: GeckoTerminal ${String(geckoError)}; profiles ${String(profileResult.reason)}; boosts ${String(boostResult.reason)}`);
     const addresses = [...new Set([...profiles, ...boosts]
       .filter((item) => item?.chainId === "solana")
       .map((item) => String(item?.tokenAddress || ""))
@@ -273,10 +302,16 @@ async function getSolanaMomentumPayloads() {
 }
 
 async function scanSolanaMomentum(env) {
+  const now = Date.now();
+  const nextAttempt = Number(await stateGet(env, "solana_next_attempt")) || 0;
+  if (now < nextAttempt) {
+    const deferred = { discovered: 0, checked: 0, skipped: "Provider cooldown", retryAt: new Date(nextAttempt).toISOString() };
+    return { raydium: deferred, pumpSwap: deferred, meteora: deferred };
+  }
   try {
     const discovery = await getSolanaMomentumPayloads();
     const payloads = discovery.payloads;
-    const now = Date.now();
+    await statePut(env, now + 9 * 60_000, "solana_next_attempt");
     const currentAlerts = parseJsonArray(await stateGet(env, "solana_momentum_alerted"));
     const legacyPumpSwapAlerts = parseJsonArray(await stateGet(env, "pumpswap_alerted"));
     const alertHistory = [...currentAlerts, ...legacyPumpSwapAlerts]
@@ -302,6 +337,7 @@ async function scanSolanaMomentum(env) {
     await statePut(env, JSON.stringify(alertHistory.slice(-300)), "solana_momentum_alerted");
     return { raydium, pumpSwap, meteora };
   } catch (error) {
+    await statePut(env, now + (String(error).includes("429") ? 15 : 9) * 60_000, "solana_next_attempt").catch(console.error);
     const failure = { discovered: 0, checked: 0, error: String(error) };
     return { raydium: failure, pumpSwap: failure, meteora: failure };
   }
@@ -390,6 +426,8 @@ async function processSolanaMomentumDex(env, payloads, config, alertHistory, now
 
 async function scanBnb(env) {
   if (!env.BITQUERY_TOKEN) return { configured: false, checked: 0, message: "Add BITQUERY_TOKEN to enable" };
+  const retryAt = Number(await stateGet(env, "bnb_provider_retry_at")) || 0;
+  if (Date.now() < retryAt) return { configured: true, checked: 0, skipped: "Provider HTTP 402 cooldown", retryAt: new Date(retryAt).toISOString() };
   try {
     const launches = await getBnbLaunches(env.BITQUERY_TOKEN);
     const now = Date.now();
@@ -433,6 +471,7 @@ async function scanBnb(env) {
     await statePut(env, JSON.stringify([...savedAlerted].slice(-500)), "bnb_alerted");
     return { configured: true, launches: launches.length, checked: candidates.length, results };
   } catch (error) {
+    if (String(error).includes("402")) await statePut(env, Date.now() + 60 * 60_000, "bnb_provider_retry_at").catch(console.error);
     return { configured: true, checked: 0, error: String(error) };
   }
 }
@@ -527,6 +566,8 @@ function taxPercent(value) {
 
 async function scanRobinhood(env) {
   if (!env.BITQUERY_TOKEN) return { configured: false, checked: 0, message: "Add BITQUERY_TOKEN to enable" };
+  const retryAt = Number(await stateGet(env, "robinhood_provider_retry_at")) || 0;
+  if (Date.now() < retryAt) return { configured: true, checked: 0, skipped: "Provider HTTP 402 cooldown", retryAt: new Date(retryAt).toISOString() };
 
   try {
     const launches = await getRobinhoodLaunches(env.BITQUERY_TOKEN);
@@ -571,6 +612,7 @@ async function scanRobinhood(env) {
     await statePut(env, JSON.stringify([...savedAlerted].slice(-500)), "robinhood_alerted");
     return { configured: true, launches: launches.length, checked: Math.min(watch.size + savedAlerted.size, 40), results };
   } catch (error) {
+    if (String(error).includes("402")) await statePut(env, Date.now() + 60 * 60_000, "robinhood_provider_retry_at").catch(console.error);
     return { configured: true, checked: 0, error: String(error) };
   }
 }
@@ -873,8 +915,25 @@ async function recordPaperWatch(env, call, review) {
   await statePut(env, JSON.stringify(positions.slice(-PAPER_RECORD_LIMIT)), "paper_positions");
 }
 
+async function updatePaperLedgerSafe(env) {
+  try {
+    return await updatePaperLedger(env);
+  } catch (error) {
+    if (String(error).includes("429")) {
+      await statePut(env, Date.now() + 15 * 60_000, "paper_next_attempt").catch(console.error);
+    }
+    return { error: String(error) };
+  }
+}
+
 async function updatePaperLedger(env) {
   const now = Date.now();
+  const nextAttempt = Number(await stateGet(env, "paper_next_attempt")) || 0;
+  if (now < nextAttempt) {
+    return { ...buildPaperReport(parseJsonArray(await stateGet(env, "paper_positions")),
+      parseJsonArray(await stateGet(env, "paper_watch"))), skipped: "Provider cooldown",
+      retryAt: new Date(nextAttempt).toISOString() };
+  }
   const watch = parseJsonArray(await stateGet(env, "paper_watch"));
   const positions = parseJsonArray(await stateGet(env, "paper_positions"));
   const watching = watch.filter((item) =>
@@ -973,6 +1032,7 @@ async function updatePaperLedger(env) {
   for (const item of watch) {
     if (item.status === "watching" && now - num(item.alertedAt) > PAPER_WATCH_WINDOW_MS) item.status = "expired";
   }
+  await statePut(env, now + 9 * 60_000, "paper_next_attempt");
   const savedPositions = positions.slice(-PAPER_RECORD_LIMIT);
   const savedWatch = watch.slice(-PAPER_RECORD_LIMIT);
   await statePut(env, JSON.stringify(savedPositions), "paper_positions");
