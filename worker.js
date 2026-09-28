@@ -999,7 +999,7 @@ function buildPaperReport(positions, watch) {
     build: BUILD_ID,
     rules: {
       entryMarketCap: `$${PAPER_ENTRY_MIN_MARKET_CAP.toLocaleString("en-US")}-$${PAPER_ENTRY_MAX_MARKET_CAP.toLocaleString("en-US")}`,
-      stop: "-30%",
+      stop: "-60%",
       milestones: ["1.5x", "2x", "3x", "5x", "10x"],
       watchHoursAfterAlert: PAPER_WATCH_WINDOW_MS / 3_600_000,
     },
