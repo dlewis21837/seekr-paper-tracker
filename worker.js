@@ -1046,7 +1046,7 @@ async function maybeSendDailyPaperReport(env, report) {
     "📊 <b>DAILY PAPER LEDGER — ALL ALERTS</b>",
     `All entries: <b>${t.entries}</b> | Open: <b>${t.open}</b>`,
     `Hit 2×: <b>${t.hit2x}</b> | Hit 3×: <b>${t.hit3x}</b>`,
-    `Stopped at −30%: <b>${t.stopped}</b>`,
+    `Stopped at −60%: <b>${t.stopped}</b>`,
     `Stopped before 2×: <b>${t.stoppedBefore2x}</b>`,
     `$150K–$180K group: <b>${band.entries || 0}</b> entries, <b>${band.hit2x || 0}</b> hit 2×, <b>${band.stopped || 0}</b> stopped`,
     "Paper tracking only—no automatic buying or selling.",
