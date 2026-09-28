@@ -1,5 +1,5 @@
 const CHANNEL = "SeekrTrending";
-const BUILD_ID = "paper-ledger-v13-solana-only-2026-09-28";
+const BUILD_ID = "paper-ledger-v14-diagnostics-2026-09-28";
 const MAX_MARKET_CAP = 3_000_000;
 const MAX_PUMPSWAP_MARKET_CAP = 2_000_000;
 const MIN_LIQUIDITY = 10_000;
@@ -135,6 +135,8 @@ async function runScan(env) {
     const result = await scan(env);
     const status = { at, ok: result.ok, seekrChecked: result.seekrChecked ?? 0,
       seekrErrors: (result.seekrResults || []).filter((item) => item.error).length,
+      seekrFailures: (result.seekrResults || []).filter((item) => item.error)
+        .slice(0, 3).map((item) => ({ contract: item.contract, error: item.error })),
       sources: { raydium: result.raydium, pumpSwap: result.pumpSwap, meteora: result.meteora,
         robinhood: result.robinhood, bnb: result.bnb }, paperError: result.paper?.error || null,
       error: result.error || null, skipped: result.skipped || null };
