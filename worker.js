@@ -1,5 +1,5 @@
 const CHANNEL = "SeekrTrending";
-const BUILD_ID = "paper-ledger-v12-2026-09-25";
+const BUILD_ID = "paper-ledger-v13-solana-only-2026-09-28";
 const MAX_MARKET_CAP = 3_000_000;
 const MAX_PUMPSWAP_MARKET_CAP = 2_000_000;
 const MIN_LIQUIDITY = 10_000;
@@ -80,12 +80,12 @@ export default {
       return Response.json(buildPaperReport(positions, watch));
     }
     return Response.json({
-      status: "Seekr + Raydium + PumpSwap + Meteora momentum + Robinhood Chain + BNB Chain tracker online",
+      status: "Seekr + Raydium + PumpSwap + Meteora Solana tracker online",
       build: BUILD_ID,
       schedule: "Every 3 minutes, 5:00 a.m.–8:00 p.m. Pacific",
       configured: Boolean(env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID && env.STATE),
-      robinhoodConfigured: Boolean(env.BITQUERY_TOKEN),
-      bnbConfigured: Boolean(env.BITQUERY_TOKEN),
+      robinhoodConfigured: false,
+      bnbConfigured: false,
     });
   },
 
@@ -201,13 +201,13 @@ async function scan(env) {
 
   if (processedId > lastId) await statePut(env, processedId);
   const solanaMomentum = await scanSolanaMomentum(env);
-  const robinhood = await scanRobinhood(env);
-  const bnb = await scanBnb(env);
+  const robinhood = { configured: false, checked: 0, skipped: "Solana-only mode" };
+  const bnb = { configured: false, checked: 0, skipped: "Solana-only mode" };
   const learning = await updateLearningOutcomes(env).catch((error) => ({ error: String(error) }));
   const paper = await updatePaperLedgerSafe(env);
   await maybeSendDailyPaperReport(env, paper).catch(() => {});
   if (connected) {
-    await sendTelegram(env, `✅ Seekr + Raydium + PumpSwap + Meteora momentum + Robinhood Chain + BNB Chain tracker connected. Build: <code>${BUILD_ID}</code>. Scanning every 3 minutes from 5:00 a.m. to 8:00 p.m. Pacific.`);
+    await sendTelegram(env, `✅ Seekr + Raydium + PumpSwap + Meteora Solana tracker connected. Build: <code>${BUILD_ID}</code>. Scanning every 3 minutes from 5:00 a.m. to 8:00 p.m. Pacific.`);
   }
   return { ok: true, build: BUILD_ID, seekrChecked: fresh.length, seekrResults: results, ...solanaMomentum, robinhood, bnb, learning, paper };
 }
