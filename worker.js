@@ -1,5 +1,5 @@
 const CHANNEL = "SeekrTrending";
-const BUILD_ID = "paper-ledger-v14-diagnostics-2026-09-28";
+const BUILD_ID = "paper-ledger-v15-pending-queue-2026-09-28";
 const MAX_MARKET_CAP = 3_000_000;
 const MAX_PUMPSWAP_MARKET_CAP = 2_000_000;
 const MIN_LIQUIDITY = 10_000;
@@ -135,6 +135,7 @@ async function runScan(env) {
     const result = await scan(env);
     const status = { at, ok: result.ok, seekrChecked: result.seekrChecked ?? 0,
       seekrErrors: (result.seekrResults || []).filter((item) => item.error).length,
+      seekrPending: result.seekrPending ?? 0, seekrRetryAt: result.seekrRetryAt || null,
       seekrFailures: (result.seekrResults || []).filter((item) => item.error)
         .slice(0, 3).map((item) => ({ contract: item.contract, error: item.error })),
       sources: { raydium: result.raydium, pumpSwap: result.pumpSwap, meteora: result.meteora,
@@ -176,9 +177,17 @@ async function scan(env) {
   }
 
   const fresh = lastId ? calls.filter((c) => c.id > lastId).sort((a, b) => a.id - b.id) : [];
+  const savedPending = parseJsonArray(await stateGet(env, "seekr_pending_calls"));
+  const pendingById = new Map(savedPending.filter((c) => c?.id && c?.contract).map((c) => [c.id, c]));
+  for (const call of fresh) pendingById.set(call.id, call);
+  const pending = [...pendingById.values()].sort((a, b) => a.id - b.id);
+  // Save calls before moving the cursor so an interrupted scan cannot lose them.
+  await statePut(env, JSON.stringify(pending), "seekr_pending_calls");
+  if (newestId > lastId) await statePut(env, newestId);
   const results = [];
-  let processedId = lastId;
-  for (const call of fresh) {
+  const seekrRetryAt = Number(await stateGet(env, "seekr_provider_retry_at")) || 0;
+  const seekrBatch = Date.now() < seekrRetryAt ? [] : pending.slice(0, 5);
+  for (const call of seekrBatch) {
     try {
       const pair = await getBestPair(call.contract);
       const confirmation = await confirmMarketMomentum(call, pair);
@@ -194,14 +203,20 @@ async function scan(env) {
         results.push({ contract: call.contract, alerted: false, score: effectiveScore, rawScore: review.score, safety: safety.summary, marketGate: confirmation.summary });
       }
       await recordLearningObservation(env, call, review, safety, confirmation, alerted).catch(() => {});
-      processedId = call.id;
+      const index = pending.findIndex((item) => item.id === call.id);
+      if (index >= 0) pending.splice(index, 1);
+      await statePut(env, JSON.stringify(pending), "seekr_pending_calls");
     } catch (error) {
       results.push({ contract: call.contract, error: String(error) });
-      break; // Keep this call pending so provider failures do not lose it.
+      const index = pending.findIndex((item) => item.id === call.id);
+      if (index >= 0) pending.push(...pending.splice(index, 1));
+      await statePut(env, JSON.stringify(pending), "seekr_pending_calls");
+      if (String(error).includes("429")) {
+        await statePut(env, Date.now() + 9 * 60_000, "seekr_provider_retry_at");
+        break;
+      }
     }
   }
-
-  if (processedId > lastId) await statePut(env, processedId);
   const solanaMomentum = await scanSolanaMomentum(env);
   const robinhood = { configured: false, checked: 0, skipped: "Solana-only mode" };
   const bnb = { configured: false, checked: 0, skipped: "Solana-only mode" };
@@ -211,7 +226,10 @@ async function scan(env) {
   if (connected) {
     await sendTelegram(env, `✅ Seekr + Raydium + PumpSwap + Meteora Solana tracker connected. Build: <code>${BUILD_ID}</code>. Scanning every 3 minutes from 5:00 a.m. to 8:00 p.m. Pacific.`);
   }
-  return { ok: true, build: BUILD_ID, seekrChecked: fresh.length, seekrResults: results, ...solanaMomentum, robinhood, bnb, learning, paper };
+  return { ok: true, build: BUILD_ID, seekrChecked: seekrBatch.length, seekrPending: pending.length,
+    seekrRetryAt: Date.now() < (Number(await stateGet(env, "seekr_provider_retry_at")) || 0)
+      ? new Date(Number(await stateGet(env, "seekr_provider_retry_at"))).toISOString() : null,
+    seekrResults: results, ...solanaMomentum, robinhood, bnb, learning, paper };
 }
 
 async function fetchJsonWithRetry(url, options = {}, attempts = 3) {
