@@ -1,5 +1,5 @@
 const CHANNEL = "SeekrTrending";
-const BUILD_ID = "paper-ledger-v16-rugcheck-budget-2026-09-29";
+const BUILD_ID = "paper-ledger-v17-queue-drain-2026-09-29";
 const MAX_MARKET_CAP = 3_000_000;
 const MAX_PUMPSWAP_MARKET_CAP = 2_000_000;
 const MIN_LIQUIDITY = 10_000;
@@ -186,12 +186,24 @@ async function scan(env) {
   if (newestId > lastId) await statePut(env, newestId);
   const results = [];
   const seekrRetryAt = Number(await stateGet(env, "seekr_provider_retry_at")) || 0;
-  const seekrBatch = Date.now() < seekrRetryAt ? [] : pending.slice(0, 5);
+  const seekrBatch = Date.now() < seekrRetryAt ? [] : pending.slice(0, 15);
+  let seekrSafetyChecks = 0;
   for (const call of seekrBatch) {
     try {
       const pair = await getBestPair(call.contract);
       const confirmation = await confirmMarketMomentum(call, pair);
       const review = confirmation.review;
+      // Drain market-gate failures quickly, but reserve Rugcheck to one call per
+      // scheduled scan so provider throttling cannot freeze the whole queue.
+      if (confirmation.passed && seekrSafetyChecks >= 1) {
+        results.push({ contract: call.contract, deferred: true, marketGate: confirmation.summary,
+          reason: "waiting for per-scan safety budget" });
+        const deferredIndex = pending.findIndex((item) => item.id === call.id);
+        if (deferredIndex >= 0) pending.push(...pending.splice(deferredIndex, 1));
+        await statePut(env, JSON.stringify(pending), "seekr_pending_calls");
+        continue;
+      }
+      if (confirmation.passed) seekrSafetyChecks += 1;
       // A failed market gate cannot alert; avoid spending a safety API call on it.
       const safety = confirmation.passed
         ? await getSolanaSafety(call.contract)
@@ -215,12 +227,18 @@ async function scan(env) {
       if (index >= 0) pending.push(...pending.splice(index, 1));
       await statePut(env, JSON.stringify(pending), "seekr_pending_calls");
       if (String(error).includes("429")) {
-        await statePut(env, Date.now() + 9 * 60_000, "seekr_provider_retry_at");
+        await statePut(env, Date.now() + 2 * 60_000, "seekr_provider_retry_at");
         break;
       }
     }
   }
-  const solanaMomentum = await scanSolanaMomentum(env);
+  const solanaMomentum = pending.length > 10
+    ? {
+        raydium: { discovered: 0, checked: 0, skipped: "Seekr backlog priority" },
+        pumpSwap: { discovered: 0, checked: 0, skipped: "Seekr backlog priority" },
+        meteora: { discovered: 0, checked: 0, skipped: "Seekr backlog priority" },
+      }
+    : await scanSolanaMomentum(env);
   const robinhood = { configured: false, checked: 0, skipped: "Solana-only mode" };
   const bnb = { configured: false, checked: 0, skipped: "Solana-only mode" };
   const learning = await updateLearningOutcomes(env).catch((error) => ({ error: String(error) }));
