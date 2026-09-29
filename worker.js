@@ -1165,9 +1165,9 @@ function parseCalls(html) {
 }
 
 async function getBestPair(contract, dexId = null, chainId = "solana") {
-  const response = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${contract}`);
+  const response = await fetch(`https://api.dexscreener.com/token-pairs/v1/${chainId}/${contract}`);
   const data = await check(response).then((r) => r.json());
-  let pairs = (data.pairs || []).filter((p) =>
+  let pairs = (Array.isArray(data) ? data : []).filter((p) =>
     p.chainId === chainId && (!dexId || String(p.dexId).toLowerCase().includes(dexId))
   );
   if (chainId === "solana") {
