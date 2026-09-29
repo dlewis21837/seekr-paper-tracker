@@ -192,7 +192,10 @@ async function scan(env) {
       const pair = await getBestPair(call.contract);
       const confirmation = await confirmMarketMomentum(call, pair);
       const review = confirmation.review;
-      const safety = await getSolanaSafety(call.contract);
+      // A failed market gate cannot alert; avoid spending a safety API call on it.
+      const safety = confirmation.passed
+        ? await getSolanaSafety(call.contract)
+        : { passed: false, scorePenalty: 0, summary: "skipped: market gate failed" };
       if (safety.summary?.includes("safety report unavailable")) throw new Error(safety.summary);
       const effectiveScore = review.score - num(safety.scorePenalty);
       const alerted = safety.passed && confirmation.passed && effectiveScore >= MIN_SCORE && review.marketCap <= MAX_MARKET_CAP;
