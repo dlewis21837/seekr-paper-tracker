@@ -1,5 +1,5 @@
 const CHANNEL = "SeekrTrending";
-const BUILD_ID = "paper-ledger-v15-pending-queue-2026-09-28";
+const BUILD_ID = "paper-ledger-v16-rugcheck-budget-2026-09-29";
 const MAX_MARKET_CAP = 3_000_000;
 const MAX_PUMPSWAP_MARKET_CAP = 2_000_000;
 const MIN_LIQUIDITY = 10_000;
@@ -419,14 +419,19 @@ async function processSolanaMomentumDex(env, payloads, config, alertHistory, now
     const candidates = [...tokens.values()]
       .filter((item) => !lastAlert.has(item.contract))
       .sort((a, b) => b.volumeH1 - a.volumeH1)
-      .slice(0, 5);
+      // Keep total Rugcheck usage below the provider limit while Seekr drains.
+      .slice(0, 2);
     const results = [];
     for (const call of candidates) {
       try {
         const pair = await getBestPair(call.contract, config.dexId);
         const confirmation = await confirmMarketMomentum(call, pair, { dexId: config.dexId });
         const review = confirmation.review;
-        const safety = await getSolanaSafety(call.contract);
+        // Do not spend a scarce Rugcheck request on a token that already failed
+        // the market/momentum confirmation.
+        const safety = confirmation.passed
+          ? await getSolanaSafety(call.contract)
+          : { passed: false, scorePenalty: 0, summary: "skipped: market gate failed" };
         const effectiveScore = review.score - num(safety.scorePenalty);
         const alerted = Boolean(pair && safety.passed && confirmation.passed && effectiveScore >= MIN_SCORE && review.marketCap <= MAX_PUMPSWAP_MARKET_CAP);
         if (alerted) {
