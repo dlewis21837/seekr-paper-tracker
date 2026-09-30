@@ -1,5 +1,5 @@
 const CHANNEL = "SeekrTrending";
-const BUILD_ID = "paper-ledger-v20-report-2030-pacific-2026-09-30";
+const BUILD_ID = "paper-ledger-v21-first-entry-only-2026-09-30";
 const MAX_MARKET_CAP = 3_000_000;
 const MAX_PUMPSWAP_MARKET_CAP = 2_000_000;
 const MIN_LIQUIDITY = 10_000;
@@ -914,11 +914,50 @@ function buildLearningReport(records) {
   };
 }
 
+function paperTokenKey(item) {
+  // Solana contract addresses are case-sensitive.
+  const chainId = item.chainId || paperChainId(item.source);
+  const contract = String(item.contract || "");
+  return `${chainId}:${chainId === "solana" ? contract : contract.toLowerCase()}`;
+}
+
+function firstPaperRecords(records, timeField) {
+  const first = new Map();
+  for (const item of records.filter((record) => record?.contract)) {
+    const key = paperTokenKey(item);
+    const previous = first.get(key);
+    if (!previous || num(item[timeField]) < num(previous[timeField])) first.set(key, item);
+  }
+  return [...first.values()];
+}
+
+async function loadPaperEntryHistory(env, positions) {
+  const history = parseJsonArray(await stateGet(env, "paper_entry_history"));
+  return new Set([...history, ...positions.map(paperTokenKey)]);
+}
+
 async function recordPaperWatch(env, call, review) {
   const now = Date.now();
-  const watch = parseJsonArray(await stateGet(env, "paper_watch"));
-  const positions = parseJsonArray(await stateGet(env, "paper_positions"));
-  let item = watch.find((record) => record?.contract === call.contract && record.status === "watching");
+  const watch = firstPaperRecords(parseJsonArray(await stateGet(env, "paper_watch")), "alertedAt");
+  const positions = firstPaperRecords(parseJsonArray(await stateGet(env, "paper_positions")), "entryAt");
+  const chainId = paperChainId(call.source);
+  const key = paperTokenKey({ contract: call.contract, chainId });
+  const history = await loadPaperEntryHistory(env, positions);
+  const existingPosition = positions.find((position) => paperTokenKey(position) === key);
+  if (history.has(key)) {
+    // Repeat alerts never change entry price, entry day, or exit state.
+    if (existingPosition) existingPosition.lastAlertedAt = now;
+    const existingWatch = watch.find((record) => paperTokenKey(record) === key);
+    if (existingWatch) {
+      existingWatch.lastAlertedAt = now;
+      existingWatch.status = "entered";
+    }
+    await statePut(env, JSON.stringify([...history]), "paper_entry_history");
+    await statePut(env, JSON.stringify(watch.slice(-PAPER_RECORD_LIMIT)), "paper_watch");
+    await statePut(env, JSON.stringify(positions.slice(-PAPER_RECORD_LIMIT)), "paper_positions");
+    return;
+  }
+  let item = watch.find((record) => paperTokenKey(record) === key);
   if (!item) {
     item = {
       contract: call.contract,
@@ -935,8 +974,7 @@ async function recordPaperWatch(env, call, review) {
     item.lastMarketCap = num(review.marketCap);
     item.lastAlertedAt = now;
   }
-  const chainId = paperChainId(call.source);
-  if (!positions.some((position) => position.contract === call.contract && (position.chainId || "solana") === chainId)) {
+  if (!history.has(key)) {
     const marketCap = num(review.marketCap);
     positions.push({
       id: `${call.contract}:${now}`,
@@ -964,6 +1002,8 @@ async function recordPaperWatch(env, call, review) {
     item.enteredAt = now;
     item.entryMarketCap = marketCap;
   }
+  history.add(key);
+  await statePut(env, JSON.stringify([...history]), "paper_entry_history");
   await statePut(env, JSON.stringify(watch.slice(-PAPER_RECORD_LIMIT)), "paper_watch");
   await statePut(env, JSON.stringify(positions.slice(-PAPER_RECORD_LIMIT)), "paper_positions");
 }
@@ -987,8 +1027,9 @@ async function updatePaperLedger(env) {
       parseJsonArray(await stateGet(env, "paper_watch"))), skipped: "Provider cooldown",
       retryAt: new Date(nextAttempt).toISOString() };
   }
-  const watch = parseJsonArray(await stateGet(env, "paper_watch"));
-  const positions = parseJsonArray(await stateGet(env, "paper_positions"));
+  const watch = firstPaperRecords(parseJsonArray(await stateGet(env, "paper_watch")), "alertedAt");
+  const positions = firstPaperRecords(parseJsonArray(await stateGet(env, "paper_positions")), "entryAt");
+  const history = await loadPaperEntryHistory(env, positions);
   const watching = watch.filter((item) =>
     item?.contract && item.status === "watching" && now - num(item.alertedAt) <= PAPER_WATCH_WINDOW_MS
   );
@@ -1012,7 +1053,7 @@ async function updatePaperLedger(env) {
     item.lastMarketCap = marketCap;
     item.lastCheckedAt = now;
     if (marketCap < PAPER_ENTRY_MIN_MARKET_CAP || marketCap > PAPER_ENTRY_MAX_MARKET_CAP) continue;
-    if (positions.some((position) => position.contract === item.contract)) {
+    if (history.has(paperTokenKey(item))) {
       item.status = "entered";
       continue;
     }
@@ -1039,6 +1080,7 @@ async function updatePaperLedger(env) {
       milestones: {},
     };
     positions.push(position);
+    history.add(paperTokenKey(position));
     item.status = "entered";
     item.enteredAt = now;
     item.entryMarketCap = marketCap;
@@ -1094,6 +1136,7 @@ async function updatePaperLedger(env) {
     if (item.status === "watching" && now - num(item.alertedAt) > PAPER_WATCH_WINDOW_MS) item.status = "expired";
   }
   await statePut(env, now + 9 * 60_000, "paper_next_attempt");
+  await statePut(env, JSON.stringify([...history]), "paper_entry_history");
   const savedPositions = positions.slice(-PAPER_RECORD_LIMIT);
   const savedWatch = watch.slice(-PAPER_RECORD_LIMIT);
   await statePut(env, JSON.stringify(savedPositions), "paper_positions");
@@ -1146,6 +1189,8 @@ function paperPacificDate(timestamp) {
 }
 
 function buildPaperReport(positions, watch, entryDate = null) {
+  positions = firstPaperRecords(positions, "entryAt");
+  watch = firstPaperRecords(watch, "alertedAt");
   const allPositions = positions;
   const allWatch = watch;
   if (entryDate) {
