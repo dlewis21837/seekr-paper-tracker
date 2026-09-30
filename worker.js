@@ -1234,7 +1234,7 @@ function paperChainId(source) {
 }
 
 function formatOpenRunnerMessages(runners, date) {
-  const heading = `🏃 <b>OPEN PAPER RUNNERS — ${esc(date)} (Pacific)</b>\nAll entry days; reached 2× and still open in the ledger.\n`;
+  const heading = `🏃 <b>RUNNER LIST — ${esc(date)} (Pacific)</b>\nAll entry days; reached 2× and still open in the ledger.\n`;
   if (!runners.length) return [heading + "\nNo open runners currently tracked."];
   const messages = [];
   let message = heading;
