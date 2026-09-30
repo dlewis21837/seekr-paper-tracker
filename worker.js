@@ -1,5 +1,5 @@
 const CHANNEL = "SeekrTrending";
-const BUILD_ID = "paper-ledger-v18-runner-exits-2026-09-30";
+const BUILD_ID = "paper-ledger-v19-daily-open-runners-2026-09-30";
 const MAX_MARKET_CAP = 3_000_000;
 const MAX_PUMPSWAP_MARKET_CAP = 2_000_000;
 const MIN_LIQUIDITY = 10_000;
@@ -1172,6 +1172,9 @@ function buildPaperReport(positions, watch, entryDate = null) {
   });
   return {
     build: BUILD_ID,
+    openRunners: allPositions.filter((item) => item.status === "open" &&
+      (item.partialSale || num(item.maxMultiple) >= 2))
+      .sort((a, b) => num(b.currentMultiple) - num(a.currentMultiple)),
     scope: entryDate ? "Entries opened on this Pacific date" : "Cumulative retained entries",
     entryDate,
     ...(entryDate ? {} : {
@@ -1229,6 +1232,34 @@ function paperChainId(source) {
   return "solana";
 }
 
+function formatOpenRunnerMessages(runners, date) {
+  const heading = `🏃 <b>OPEN PAPER RUNNERS — ${esc(date)} (Pacific)</b>\nAll entry days; reached 2× and still open in the ledger.\n`;
+  if (!runners.length) return [heading + "\nNo open runners currently tracked."];
+  const messages = [];
+  let message = heading;
+  for (const item of runners) {
+    const chain = item.chainId || "solana";
+    const link = `https://dexscreener.com/${encodeURIComponent(chain)}/${encodeURIComponent(item.contract)}`;
+    const rule = item.strategyVersion === PAPER_STRATEGY_VERSION
+      ? `Half sold; 35% trail trigger: ${num(item.trailingStopMultiple).toFixed(2)}×`
+      : "Legacy paper exit rules";
+    const block = [
+      `<b>${esc(item.name || "Unknown")}</b>`,
+      `Latest: ${num(item.currentMultiple).toFixed(2)}× | Observed peak: ${num(item.maxMultiple).toFixed(2)}×`,
+      `Entry day: ${paperPacificDate(num(item.entryAt))} | ${rule}`,
+      `Last sample: ${item.lastCheckedAt ? new Date(item.lastCheckedAt).toISOString() : "pending"}${num(item.missingSamples) > 0 ? " — quote missing; latest value is stale" : ""}`,
+      `CA: <a href="${link}">${esc(item.contract)}</a>`,
+    ].join("\n");
+    if (message.length + block.length + 2 > 3500) {
+      messages.push(message);
+      message = heading;
+    }
+    message += "\n" + block + "\n";
+  }
+  messages.push(message);
+  return messages;
+}
+
 async function maybeSendDailyPaperReport(env, report) {
   if (!report?.totals) return;
   const parts = new Intl.DateTimeFormat("en-CA", {
@@ -1243,6 +1274,7 @@ async function maybeSendDailyPaperReport(env, report) {
   if (Number(value("hour")) < 19) return;
   const date = `${value("year")}-${value("month")}-${value("day")}`;
   if ((await stateGet(env, "paper_daily_report_date")) === date) return;
+  const openRunners = report.openRunners || [];
   report = report.daily || report;
   const t = report.totals;
   const band = report.cohorts?.target150kTo180k || {};
@@ -1261,6 +1293,9 @@ async function maybeSendDailyPaperReport(env, report) {
     "Sampled market-cap estimates; fees/slippage excluded. Missing quotes valued at zero.",
     "Paper tracking only—no automatic buying or selling.",
   ].join("\n"));
+  for (const message of formatOpenRunnerMessages(openRunners, date)) {
+    await sendTelegram(env, message);
+  }
   await statePut(env, date, "paper_daily_report_date");
 }
 
