@@ -1,5 +1,5 @@
 const CHANNEL = "SeekrTrending";
-const BUILD_ID = "paper-ledger-v21-first-entry-only-2026-09-30";
+const BUILD_ID = "paper-ledger-v22-per-coin-results-2026-09-30";
 const MAX_MARKET_CAP = 3_000_000;
 const MAX_PUMPSWAP_MARKET_CAP = 2_000_000;
 const MIN_LIQUIDITY = 10_000;
@@ -1268,7 +1268,7 @@ function buildPaperReport(positions, watch, entryDate = null) {
       target150kTo180k: cohort(targetBand),
       allOtherEntries: cohort(outsideBand),
     },
-    positions: positions.slice(-100).reverse(),
+    positions: [...positions].reverse(),
   };
 }
 
@@ -1278,24 +1278,51 @@ function paperChainId(source) {
   return "solana";
 }
 
-function formatOpenRunnerMessages(runners, date) {
-  const heading = `🏃 <b>RUNNER LIST — ${esc(date)} (Pacific)</b>\nAll entry days; reached 2× and still open in the ledger.\n`;
-  if (!runners.length) return [heading + "\nNo open runners currently tracked."];
+function isOpenPaperRunner(item) {
+  return item.status === "open" && Boolean(item.partialSale || num(item.maxMultiple) >= 2);
+}
+
+function paperProfitDetail(item) {
+  const modern = item.strategyVersion === PAPER_STRATEGY_VERSION;
+  const open = item.status === "open";
+  const remaining = open ? (modern ? num(item.remainingFraction) : 1) : 0;
+  const proceeds = modern ? num(item.realizedReturnMultiple) : (open ? 0 : num(item.exitMultiple));
+  const total = proceeds + remaining * num(item.currentMultiple);
+  const bookedProfit = proceeds - (1 - remaining);
+  const signed = (value) => `${value >= 0 ? "+" : "-"}${Math.abs(value).toFixed(2)}`;
+  return `Paper P&amp;L: ${signed((total - 1) * 100)}% (${signed((total - 1) * 100)} dollars per $100 entry)\nBooked P&amp;L: ${signed(bookedProfit * 100)} dollars per $100 | Remaining: ${(remaining * 100).toFixed(0)}%${item.status === "unpriced" ? "\nUnpriced exit: remaining stake valued at zero; result is an estimate." : ""}`;
+}
+
+function formatPaperCoinBlock(item) {
+  const chain = item.chainId || "solana";
+  const link = `https://dexscreener.com/${encodeURIComponent(chain)}/${encodeURIComponent(item.contract)}`;
+  const peak = num(item.maxMultiple);
+  const milestones = [2, 3, 5, 10].filter((target) => peak >= target).map((target) => `${target}×`);
+  const open = item.status === "open";
+  const marketCap = open ? num(item.currentMarketCap) : num(item.exitMarketCap);
+  const multiple = open ? num(item.currentMultiple) : num(item.exitMultiple);
+  const lines = [
+    `<b>${esc(item.name || "Unknown")}</b> — ${esc(item.status)}`,
+    `Initial mcap: ${usd(num(item.entryMarketCap))} | Entry day: ${paperPacificDate(num(item.entryAt))}`,
+    `${open ? "Latest" : "Exit"} mcap: ${usd(marketCap)} (${multiple.toFixed(2)}×) | Observed peak: ${peak.toFixed(2)}×`,
+    `Reached: ${milestones.length ? milestones.join(", ") : "Below 2×"}`,
+    paperProfitDetail(item),
+  ];
+  if (item.partialSale) lines.push(`Half sold at ${num(item.partialSale.multiple).toFixed(2)}×`);
+  if (open && item.partialSale) lines.push(`35% trail trigger: ${usd(num(item.trailingStopMarketCap))} (${num(item.trailingStopMultiple).toFixed(2)}×)`);
+  if (item.exitReason) lines.push(`Exit reason: ${esc(item.exitReason)}`);
+  if (item.strategyVersion !== PAPER_STRATEGY_VERSION) lines.push("Legacy paper exit rules");
+  if (open) lines.push(`Last sample: ${item.lastCheckedAt ? new Date(item.lastCheckedAt).toISOString() : "pending"}${num(item.missingSamples) > 0 ? " — quote missing; latest value is stale" : ""}`);
+  lines.push(`CA: <a href="${link}">${esc(item.contract)}</a>`);
+  return lines.join("\n");
+}
+
+function formatPaperCoinMessages(items, heading, emptyText) {
+  if (!items.length) return [heading + "\n" + emptyText];
   const messages = [];
   let message = heading;
-  for (const item of runners) {
-    const chain = item.chainId || "solana";
-    const link = `https://dexscreener.com/${encodeURIComponent(chain)}/${encodeURIComponent(item.contract)}`;
-    const rule = item.strategyVersion === PAPER_STRATEGY_VERSION
-      ? `Half sold; 35% trail trigger: ${num(item.trailingStopMultiple).toFixed(2)}×`
-      : "Legacy paper exit rules";
-    const block = [
-      `<b>${esc(item.name || "Unknown")}</b>`,
-      `Latest: ${num(item.currentMultiple).toFixed(2)}× | Observed peak: ${num(item.maxMultiple).toFixed(2)}×`,
-      `Entry day: ${paperPacificDate(num(item.entryAt))} | ${rule}`,
-      `Last sample: ${item.lastCheckedAt ? new Date(item.lastCheckedAt).toISOString() : "pending"}${num(item.missingSamples) > 0 ? " — quote missing; latest value is stale" : ""}`,
-      `CA: <a href="${link}">${esc(item.contract)}</a>`,
-    ].join("\n");
+  for (const item of items) {
+    const block = formatPaperCoinBlock(item);
     if (message.length + block.length + 2 > 3500) {
       messages.push(message);
       message = heading;
@@ -1304,6 +1331,18 @@ function formatOpenRunnerMessages(runners, date) {
   }
   messages.push(message);
   return messages;
+}
+
+function formatOpenRunnerMessages(runners, date) {
+  return formatPaperCoinMessages(runners,
+    `🏃 <b>RUNNER LIST — ${esc(date)} (Pacific)</b>\nAll entry days; reached 2× and still open.\nP&amp;L uses a hypothetical $100 initial stake; includes remaining open value.\n`,
+    "No open runners currently tracked.");
+}
+
+function formatDailyPaperCoinMessages(positions, date) {
+  return formatPaperCoinMessages(positions.filter((item) => !isOpenPaperRunner(item)),
+    `📋 <b>COIN RESULTS — ${esc(date)} (Pacific)</b>\nToday's entries; open runners appear separately on the runner list.\nP&amp;L uses a hypothetical $100 initial stake; includes remaining open value.\n`,
+    "No other entries today; see the runner list for any open runners.");
 }
 
 async function maybeSendDailyPaperReport(env, report) {
@@ -1340,6 +1379,9 @@ async function maybeSendDailyPaperReport(env, report) {
     "Sampled market-cap estimates; fees/slippage excluded. Missing quotes valued at zero.",
     "Paper tracking only—no automatic buying or selling.",
   ].join("\n"));
+  for (const message of formatDailyPaperCoinMessages(report.positions || [], date)) {
+    await sendTelegram(env, message);
+  }
   for (const message of formatOpenRunnerMessages(openRunners, date)) {
     await sendTelegram(env, message);
   }
