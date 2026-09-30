@@ -1,5 +1,5 @@
 const CHANNEL = "SeekrTrending";
-const BUILD_ID = "paper-ledger-v22-per-coin-results-2026-09-30";
+const BUILD_ID = "scanner-v23-bounded-queue-2026-09-30";
 const MAX_MARKET_CAP = 3_000_000;
 const MAX_PUMPSWAP_MARKET_CAP = 2_000_000;
 const MIN_LIQUIDITY = 10_000;
@@ -104,6 +104,24 @@ export class State {
 
   async fetch(request) {
     const url = new URL(request.url);
+    if (url.pathname === "/acquire" && request.method === "POST") {
+      const token = await request.text();
+      const acquired = await this.storage.transaction(async (tx) => {
+        const lease = await tx.get("scan_lease");
+        if (lease && lease.until > Date.now()) return false;
+        await tx.put("scan_lease", { token, until: Date.now() + 10 * 60_000 });
+        return true;
+      });
+      return Response.json({ acquired });
+    }
+    if (url.pathname === "/release" && request.method === "POST") {
+      const token = await request.text();
+      await this.storage.transaction(async (tx) => {
+        const lease = await tx.get("scan_lease");
+        if (lease?.token === token) await tx.delete("scan_lease");
+      });
+      return new Response("ok");
+    }
     if (url.pathname === "/get") {
       const key = safeStateKey(url.searchParams.get("key") || "last_message_id");
       return new Response(String((await this.storage.get(key)) || ""));
@@ -134,6 +152,11 @@ async function statePut(env, value, key = "last_message_id") {
 
 async function runScan(env) {
   const at = new Date().toISOString();
+  if (!env.STATE) return { ok: false, at, error: "Missing STATE binding" };
+  const stub = env.STATE.get(env.STATE.idFromName("seekr"));
+  const token = crypto.randomUUID();
+  const lease = await stub.fetch("https://state/acquire", { method: "POST", body: token }).then((r) => r.json());
+  if (!lease.acquired) return { ok: true, at, skipped: "Scan already running" };
   try {
     const result = await scan(env);
     const status = { at, ok: result.ok, seekrChecked: result.seekrChecked ?? 0,
@@ -151,6 +174,8 @@ async function runScan(env) {
     console.error("Scan failed", error);
     await statePut(env, JSON.stringify(result), "last_scan_status").catch(console.error);
     return result;
+  } finally {
+    await stub.fetch("https://state/release", { method: "POST", body: token }).catch(console.error);
   }
 }
 
@@ -165,7 +190,11 @@ async function scan(env) {
     return { ok: true, skipped: "Outside active hours", learning, paper };
   }
 
+  // Price tracking must run before potentially slow discovery or safety checks.
+  const paper = await updatePaperLedgerSafe(env);
+  await maybeSendDailyPaperReport(env, paper).catch(console.error);
   const html = await fetch(`https://t.me/s/${CHANNEL}`, {
+    signal: AbortSignal.timeout(15_000),
     headers: { "User-Agent": "Mozilla/5.0 SeekrTracker/1.0" },
   }).then(check).then((r) => r.text());
 
@@ -184,7 +213,9 @@ async function scan(env) {
   const savedPending = parseJsonArray(await stateGet(env, "seekr_pending_calls"));
   const pendingById = new Map(savedPending.filter((c) => c?.id && c?.contract).map((c) => [c.id, c]));
   for (const call of fresh) pendingById.set(call.id, call);
-  const pending = [...pendingById.values()].sort((a, b) => a.id - b.id);
+  // Keep one pending review per exact token; repeated source posts must not inflate the queue.
+  const pending = [...pendingById.values()].sort((a, b) => a.id - b.id)
+    .filter((call, index, all) => all.findIndex((item) => item.contract === call.contract) === index);
   // Save calls before moving the cursor so an interrupted scan cannot lose them.
   await statePut(env, JSON.stringify(pending), "seekr_pending_calls");
   if (newestId > lastId) await statePut(env, newestId);
@@ -194,6 +225,8 @@ async function scan(env) {
   let seekrSafetyChecks = 0;
   for (const call of seekrBatch) {
     try {
+      // Bound slow 20-second confirmations to one Seekr candidate per scan.
+      if (seekrSafetyChecks >= 1) break;
       const pair = await getBestPair(call.contract);
       const confirmation = await confirmMarketMomentum(call, pair);
       const review = confirmation.review;
@@ -236,18 +269,10 @@ async function scan(env) {
       }
     }
   }
-  const solanaMomentum = pending.length > 10
-    ? {
-        raydium: { discovered: 0, checked: 0, skipped: "Seekr backlog priority" },
-        pumpSwap: { discovered: 0, checked: 0, skipped: "Seekr backlog priority" },
-        meteora: { discovered: 0, checked: 0, skipped: "Seekr backlog priority" },
-      }
-    : await scanSolanaMomentum(env);
+  const solanaMomentum = await scanSolanaMomentum(env);
   const robinhood = { configured: false, checked: 0, skipped: "Solana-only mode" };
   const bnb = { configured: false, checked: 0, skipped: "Solana-only mode" };
   const learning = await updateLearningOutcomes(env).catch((error) => ({ error: String(error) }));
-  const paper = await updatePaperLedgerSafe(env);
-  await maybeSendDailyPaperReport(env, paper).catch(() => {});
   if (connected) {
     await sendTelegram(env, `✅ Seekr + Raydium + PumpSwap + Meteora Solana tracker connected. Build: <code>${BUILD_ID}</code>. Scanning every 3 minutes from 5:00 a.m. to 8:00 p.m. Pacific.`);
   }
@@ -1419,7 +1444,7 @@ function parseCalls(html) {
 }
 
 async function getBestPair(contract, dexId = null, chainId = "solana") {
-  const response = await fetch(`https://api.dexscreener.com/token-pairs/v1/${chainId}/${contract}`);
+  const response = await fetch(`https://api.dexscreener.com/token-pairs/v1/${chainId}/${contract}`, { signal: AbortSignal.timeout(15_000) });
   const data = await check(response).then((r) => r.json());
   let pairs = (Array.isArray(data) ? data : []).filter((p) =>
     p.chainId === chainId && (!dexId || String(p.dexId).toLowerCase().includes(dexId))
@@ -1471,6 +1496,7 @@ async function getSolanaSafety(contract) {
   try {
     const response = await fetch(`https://api.rugcheck.xyz/v1/tokens/${contract}/report`, {
       headers: { "User-Agent": "SeekrSafetyGate/1.0" },
+      signal: AbortSignal.timeout(15_000),
     });
     const data = await check(response).then((r) => r.json());
     return reviewSolanaSafety(data);
