@@ -1,5 +1,5 @@
 const CHANNEL = "SeekrTrending";
-const BUILD_ID = "paper-ledger-v17-queue-drain-2026-09-29";
+const BUILD_ID = "paper-ledger-v18-runner-exits-2026-09-30";
 const MAX_MARKET_CAP = 3_000_000;
 const MAX_PUMPSWAP_MARKET_CAP = 2_000_000;
 const MIN_LIQUIDITY = 10_000;
@@ -39,6 +39,9 @@ const LEARNING_RECORD_LIMIT = 100;
 const PAPER_ENTRY_MIN_MARKET_CAP = 150_000;
 const PAPER_ENTRY_MAX_MARKET_CAP = 180_000;
 const PAPER_STOP_MULTIPLE = 0.40;
+const PAPER_STRATEGY_VERSION = "half-at-2x-trail-35-v1";
+const PAPER_TAKE_PROFIT_MULTIPLE = 2;
+const PAPER_TRAIL_FRACTION = 0.35;
 const PAPER_WATCH_WINDOW_MS = 24 * 60 * 60 * 1000;
 const PAPER_POSITION_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 const PAPER_RECORD_LIMIT = 300;
@@ -945,6 +948,9 @@ async function recordPaperWatch(env, call, review) {
       entryMarketCap: marketCap,
       entryLiquidity: num(review.liquidity),
       stopMarketCap: marketCap * PAPER_STOP_MULTIPLE,
+      strategyVersion: PAPER_STRATEGY_VERSION,
+      remainingFraction: 1,
+      realizedReturnMultiple: 0,
       targetBand: marketCap >= PAPER_ENTRY_MIN_MARKET_CAP && marketCap <= PAPER_ENTRY_MAX_MARKET_CAP,
       status: "open",
       currentMarketCap: marketCap,
@@ -1020,6 +1026,9 @@ async function updatePaperLedger(env) {
       entryMarketCap: marketCap,
       entryLiquidity: num(pair?.liquidity?.usd),
       stopMarketCap: marketCap * PAPER_STOP_MULTIPLE,
+      strategyVersion: PAPER_STRATEGY_VERSION,
+      remainingFraction: 1,
+      realizedReturnMultiple: 0,
       targetBand: true,
       status: "open",
       currentMarketCap: marketCap,
@@ -1045,6 +1054,7 @@ async function updatePaperLedger(env) {
         position.closedAt = now;
         position.exitMarketCap = 0;
         position.exitMultiple = 0;
+        if (position.strategyVersion === PAPER_STRATEGY_VERSION) closePaperPosition(position, "missing-data", 0, now);
       }
       continue;
     }
@@ -1061,6 +1071,10 @@ async function updatePaperLedger(env) {
       if (multiple >= target && !position.milestones[key]) {
         position.milestones[key] = { at: now, marketCap, multiple };
       }
+    }
+    if (position.strategyVersion === PAPER_STRATEGY_VERSION) {
+      applyPaperExitRules(position, multiple, now);
+      continue;
     }
     if (multiple <= PAPER_STOP_MULTIPLE) {
       position.status = "stopped";
@@ -1086,7 +1100,62 @@ async function updatePaperLedger(env) {
   return buildPaperReport(savedPositions, savedWatch);
 }
 
-function buildPaperReport(positions, watch) {
+function closePaperPosition(position, reason, multiple, now) {
+  position.realizedReturnMultiple = num(position.realizedReturnMultiple) + num(position.remainingFraction) * multiple;
+  position.remainingFraction = 0;
+  position.status = reason === "trailing-stop" ? "trailed" : reason === "time-limit" ? "expired" : reason === "missing-data" ? "unpriced" : "stopped";
+  position.exitReason = reason;
+  position.closedAt = now;
+  position.exitMultiple = multiple;
+  position.exitMarketCap = num(position.entryMarketCap) * multiple;
+  position.totalReturnMultiple = position.realizedReturnMultiple;
+  position.pnlPct = (position.totalReturnMultiple - 1) * 100;
+}
+
+function applyPaperExitRules(position, multiple, now) {
+  // Use observed samples as fills; do not invent fills at crossed thresholds.
+  if (!position.partialSale && multiple <= PAPER_STOP_MULTIPLE) {
+    closePaperPosition(position, "initial-stop", multiple, now);
+    return;
+  }
+  if (!position.partialSale && multiple >= PAPER_TAKE_PROFIT_MULTIPLE) {
+    position.partialSale = { at: now, multiple, fraction: 0.5 };
+    position.realizedReturnMultiple = 0.5 * multiple;
+    position.remainingFraction = 0.5;
+    position.runnerPeakMultiple = multiple;
+  }
+  if (position.partialSale) {
+    position.runnerPeakMultiple = Math.max(num(position.runnerPeakMultiple), multiple);
+    position.trailingStopMultiple = position.runnerPeakMultiple * (1 - PAPER_TRAIL_FRACTION);
+    position.trailingStopMarketCap = num(position.entryMarketCap) * position.trailingStopMultiple;
+    if (multiple <= position.trailingStopMultiple) {
+      closePaperPosition(position, "trailing-stop", multiple, now);
+      return;
+    }
+  }
+  if (now - num(position.entryAt) > PAPER_POSITION_WINDOW_MS) {
+    closePaperPosition(position, "time-limit", multiple, now);
+  }
+}
+
+function paperPacificDate(timestamp) {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Los_Angeles", year: "numeric", month: "2-digit", day: "2-digit",
+  }).format(new Date(timestamp));
+}
+
+function buildPaperReport(positions, watch, entryDate = null) {
+  const allPositions = positions;
+  const allWatch = watch;
+  if (entryDate) {
+    positions = positions.filter((item) => paperPacificDate(num(item.entryAt)) === entryDate);
+    watch = watch.filter((item) => paperPacificDate(num(item.alertedAt)) === entryDate);
+  }
+  const strategyPositions = positions.filter((item) => item.strategyVersion === PAPER_STRATEGY_VERSION);
+  const strategyClosed = strategyPositions.filter((item) => item.status !== "open");
+  const realized = strategyPositions.reduce((sum, item) => sum + num(item.realizedReturnMultiple), 0);
+  const remaining = strategyPositions.filter((item) => item.status === "open")
+    .reduce((sum, item) => sum + num(item.remainingFraction) * num(item.currentMultiple), 0);
   const open = positions.filter((item) => item.status === "open");
   const stopped = positions.filter((item) => item.status === "stopped");
   const hit2x = positions.filter((item) => num(item.maxMultiple) >= 2);
@@ -1103,9 +1172,24 @@ function buildPaperReport(positions, watch) {
   });
   return {
     build: BUILD_ID,
+    scope: entryDate ? "Entries opened on this Pacific date" : "Cumulative retained entries",
+    entryDate,
+    ...(entryDate ? {} : {
+      daily: buildPaperReport(allPositions, allWatch, paperPacificDate(Date.now())),
+      days: [...new Set(allPositions.map((item) => paperPacificDate(num(item.entryAt))))]
+        .sort().reverse().map((date) => {
+          const day = buildPaperReport(allPositions, allWatch, date);
+          return { date, totals: day.totals, strategy: day.strategy, cohorts: day.cohorts };
+        }),
+    }),
     rules: {
       entryMarketCap: `$${PAPER_ENTRY_MIN_MARKET_CAP.toLocaleString("en-US")}-$${PAPER_ENTRY_MAX_MARKET_CAP.toLocaleString("en-US")}`,
       stop: "-60%",
+      takeProfit: "Sell half at first observed 2x or higher",
+      runnerTrail: "-35% from highest observed price after half-sale",
+      strategyVersion: PAPER_STRATEGY_VERSION,
+      execution: "Sampled market-cap proxy; excludes fees and slippage; missing quotes are marked unpriced",
+      legacyEntries: "Keep original exit rules",
       milestones: ["1.5x", "2x", "3x", "5x", "10x"],
       watchHoursAfterAlert: PAPER_WATCH_WINDOW_MS / 3_600_000,
     },
@@ -1117,6 +1201,19 @@ function buildPaperReport(positions, watch) {
       stoppedBefore2x: stoppedBefore2x.length,
       hit2x: hit2x.length,
       hit3x: hit3x.length,
+    },
+    strategy: {
+      entries: strategyPositions.length,
+      legacyEntries: positions.length - strategyPositions.length,
+      halfSold: strategyPositions.filter((item) => item.partialSale).length,
+      trailed: strategyPositions.filter((item) => item.status === "trailed").length,
+      unpriced: strategyPositions.filter((item) => item.status === "unpriced").length,
+      closed: strategyClosed.length,
+      realizedReturnUnits: realized,
+      remainingValueUnits: remaining,
+      closedPnlUnits: strategyClosed.reduce((sum, item) => sum + num(item.totalReturnMultiple) - 1, 0),
+      netPnlUnits: realized + remaining - strategyPositions.length,
+      unitBasis: "Equal initial stake per entry; missing quotes value remaining stake at zero",
     },
     cohorts: {
       target150kTo180k: cohort(targetBand),
@@ -1146,15 +1243,22 @@ async function maybeSendDailyPaperReport(env, report) {
   if (Number(value("hour")) < 19) return;
   const date = `${value("year")}-${value("month")}-${value("day")}`;
   if ((await stateGet(env, "paper_daily_report_date")) === date) return;
+  report = report.daily || report;
   const t = report.totals;
   const band = report.cohorts?.target150kTo180k || {};
   await sendTelegram(env, [
-    "📊 <b>DAILY PAPER LEDGER — ALL ALERTS</b>",
+    `📊 <b>DAILY PAPER LEDGER — ${esc(date)} (Pacific)</b>`,
+    "Entries opened today only; earlier days are separate.",
     `All entries: <b>${t.entries}</b> | Open: <b>${t.open}</b>`,
     `Hit 2×: <b>${t.hit2x}</b> | Hit 3×: <b>${t.hit3x}</b>`,
-    `Stopped at −60%: <b>${t.stopped}</b>`,
+    `Initial-stop exits (sampled): <b>${t.stopped}</b>`,
     `Stopped before 2×: <b>${t.stoppedBefore2x}</b>`,
     `$150K–$180K group: <b>${band.entries || 0}</b> entries, <b>${band.hit2x || 0}</b> hit 2×, <b>${band.stopped || 0}</b> stopped`,
+    `New strategy entries: <b>${report.strategy?.entries || 0}</b> | Legacy: <b>${report.strategy?.legacyEntries || 0}</b>`,
+    `Half sold at 2×+: <b>${report.strategy?.halfSold || 0}</b> | 35% trail exits: <b>${report.strategy?.trailed || 0}</b>`,
+    `New strategy P&amp;L (equal stakes): <b>${num(report.strategy?.netPnlUnits).toFixed(2)} units</b> (includes open value)`,
+    `Closed P&amp;L: <b>${num(report.strategy?.closedPnlUnits).toFixed(2)} units</b> | Unpriced exits: <b>${report.strategy?.unpriced || 0}</b>`,
+    "Sampled market-cap estimates; fees/slippage excluded. Missing quotes valued at zero.",
     "Paper tracking only—no automatic buying or selling.",
   ].join("\n"));
   await statePut(env, date, "paper_daily_report_date");
