@@ -1,5 +1,5 @@
 const CHANNEL = "SeekrTrending";
-const BUILD_ID = "paper-ledger-v19-daily-open-runners-2026-09-30";
+const BUILD_ID = "paper-ledger-v20-report-2030-pacific-2026-09-30";
 const MAX_MARKET_CAP = 3_000_000;
 const MAX_PUMPSWAP_MARKET_CAP = 2_000_000;
 const MIN_LIQUIDITY = 10_000;
@@ -161,6 +161,7 @@ async function scan(env) {
   if (!insidePacificWindow()) {
     const learning = await updateLearningOutcomes(env).catch((error) => ({ error: String(error) }));
     const paper = await updatePaperLedgerSafe(env);
+    await maybeSendDailyPaperReport(env, paper).catch(console.error);
     return { ok: true, skipped: "Outside active hours", learning, paper };
   }
 
@@ -1268,10 +1269,11 @@ async function maybeSendDailyPaperReport(env, report) {
     month: "2-digit",
     day: "2-digit",
     hour: "2-digit",
+    minute: "2-digit",
     hourCycle: "h23",
   }).formatToParts(new Date());
   const value = (type) => parts.find((part) => part.type === type)?.value || "";
-  if (Number(value("hour")) < 19) return;
+  if (Number(value("hour")) * 60 + Number(value("minute")) < 20 * 60 + 30) return;
   const date = `${value("year")}-${value("month")}-${value("day")}`;
   if ((await stateGet(env, "paper_daily_report_date")) === date) return;
   const openRunners = report.openRunners || [];
