@@ -1,5 +1,5 @@
 const CHANNEL = "SeekrTrending";
-const BUILD_ID = "scanner-v25-shared-dex-budget-2026-09-30";
+const BUILD_ID = "scanner-v26-clean-dex-circuit-breaker-2026-10-01";
 const MAX_MARKET_CAP = 3_000_000;
 const MAX_PUMPSWAP_MARKET_CAP = 2_000_000;
 const MIN_LIQUIDITY = 10_000;
@@ -135,6 +135,15 @@ export class State {
       });
       return Response.json(result);
     }
+    if (url.pathname === "/dex-success" && request.method === "POST") {
+      await this.storage.transaction(async (tx) => {
+        const budget = (await tx.get("dex_budget")) || {};
+        budget.strikes = 0;
+        budget.retryAt = 0;
+        await tx.put("dex_budget", budget);
+      });
+      return new Response("ok");
+    }
     if (url.pathname === "/acquire" && request.method === "POST") {
       const token = await request.text();
       const acquired = await this.storage.transaction(async (tx) => {
@@ -193,6 +202,7 @@ async function runScan(env) {
     const result = await scan(env);
     const status = { at, ok: result.ok, seekrChecked: result.seekrChecked ?? 0,
       seekrErrors: (result.seekrResults || []).filter((item) => item.error).length,
+      seekrDeferred: result.seekrDeferred ?? 0,
       seekrPending: result.seekrPending ?? 0, seekrRetryAt: result.seekrRetryAt || null,
       seekrFailures: (result.seekrResults || []).filter((item) => item.error)
         .slice(0, 3).map((item) => ({ contract: item.contract, error: item.error })),
@@ -258,11 +268,21 @@ async function scan(env) {
   const results = [];
   const seekrRetryAt = Number(await stateGet(env, "seekr_provider_retry_at")) || 0;
   const seekrBatch = Date.now() < seekrRetryAt ? [] : pending.slice(0, 15);
+  let seekrDexDeferred = false;
   if (seekrBatch.length) {
-    await getBestPairs(seekrBatch.map((call) => call.contract), "solana", env).catch(() => {});
+    try {
+      await getBestPairs(seekrBatch.map((call) => call.contract), "solana", env);
+    } catch (error) {
+      if (isDexDeferral(error)) {
+        seekrDexDeferred = true;
+        await persistSeekrDexRetry(env);
+      } else {
+        throw error;
+      }
+    }
   }
   let seekrSafetyChecks = 0;
-  for (const call of seekrBatch) {
+  for (const call of seekrDexDeferred ? [] : seekrBatch) {
     try {
       // Bound slow 20-second confirmations to one Seekr candidate per scan.
       if (seekrSafetyChecks >= 1) break;
@@ -298,10 +318,14 @@ async function scan(env) {
       if (index >= 0) pending.splice(index, 1);
       await statePut(env, JSON.stringify(pending), "seekr_pending_calls");
     } catch (error) {
-      results.push({ contract: call.contract, error: String(error) });
       const index = pending.findIndex((item) => item.id === call.id);
       if (index >= 0) pending.push(...pending.splice(index, 1));
       await statePut(env, JSON.stringify(pending), "seekr_pending_calls");
+      if (isDexDeferral(error)) {
+        await persistSeekrDexRetry(env);
+        break;
+      }
+      results.push({ contract: call.contract, error: String(error) });
       if (String(error).includes("429")) {
         await statePut(env, Date.now() + 2 * 60_000, "seekr_provider_retry_at");
         break;
@@ -315,10 +339,25 @@ async function scan(env) {
   if (connected) {
     await sendTelegram(env, `✅ Seekr + Raydium + PumpSwap + Meteora Solana tracker connected. Build: <code>${BUILD_ID}</code>. Scanning every 3 minutes from 5:00 a.m. to 8:00 p.m. Pacific.`);
   }
-  return { ok: true, build: BUILD_ID, seekrChecked: results.length, seekrPending: pending.length,
+  return { ok: true, build: BUILD_ID, seekrChecked: results.length, seekrDeferred: seekrDexDeferred ? seekrBatch.length : 0,
+    seekrPending: pending.length,
     seekrRetryAt: Date.now() < (Number(await stateGet(env, "seekr_provider_retry_at")) || 0)
       ? new Date(Number(await stateGet(env, "seekr_provider_retry_at"))).toISOString() : null,
     seekrResults: results, ...solanaMomentum, robinhood, bnb, learning, paper };
+}
+
+function isDexDeferral(error) {
+  const message = String(error);
+  return message.includes("DexScreener provider cooldown") ||
+    message.includes("DexScreener request budget") ||
+    message.includes("api.dexscreener.com HTTP 429") ||
+    message.includes("shared cooldown");
+}
+
+async function persistSeekrDexRetry(env) {
+  const retryAt = Date.parse(env?._dex?.retryAt || "");
+  const fallback = Date.now() + 2 * 60_000;
+  await statePut(env, Number.isFinite(retryAt) ? retryAt + 1_000 : fallback, "seekr_provider_retry_at");
 }
 
 async function fetchJsonWithRetry(url, options = {}, attempts = 3) {
@@ -1573,6 +1612,9 @@ async function dexJson(env, url, options = {}) {
     }).then((r) => r.json());
     if (env._dex) { env._dex.throttled += 1; env._dex.retryAt = new Date(backoff.retryAt).toISOString(); }
     throw new Error("api.dexscreener.com HTTP 429; shared cooldown until " + new Date(backoff.retryAt).toISOString());
+  }
+  if (response.ok) {
+    await stub.fetch("https://state/dex-success", { method: "POST" }).catch(() => {});
   }
   return check(response).then((r) => r.json());
 }
