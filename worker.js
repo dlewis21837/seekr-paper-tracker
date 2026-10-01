@@ -1,5 +1,5 @@
 const CHANNEL = "SeekrTrending";
-const BUILD_ID = "scanner-v30-three-minute-discovery-2026-10-01";
+const BUILD_ID = "scanner-v31-shared-confirmation-2026-10-01";
 const MAX_MARKET_CAP = 3_000_000;
 const MAX_PUMPSWAP_MARKET_CAP = 2_000_000;
 const MIN_LIQUIDITY = 10_000;
@@ -204,7 +204,7 @@ async function statePut(env, value, key = "last_message_id") {
 }
 
 async function runScan(env) {
-  env = { ...env, _scanDeadline: Date.now() + 150_000, _dex: { cache: new Map(), requests: 0, cacheHits: 0, throttled: 0, priority: "discovery" } };
+  env = { ...env, _scanDeadline: Date.now() + 150_000, _dex: { cache: new Map(), confirmations: new Map(), sharedConfirmations: 0, requests: 0, cacheHits: 0, throttled: 0, priority: "discovery" } };
   const at = new Date().toISOString();
   if (!env.STATE) return { ok: false, at, error: "Missing STATE binding" };
   const stub = env.STATE.get(env.STATE.idFromName("seekr"));
@@ -223,7 +223,7 @@ async function runScan(env) {
       sources: { raydium: result.raydium, pumpSwap: result.pumpSwap, meteora: result.meteora,
         robinhood: result.robinhood, bnb: result.bnb }, paperError: result.paper?.error || null,
       error: result.error || null, skipped: result.skipped || null,
-      dex: { requests: env._dex.requests, cacheHits: env._dex.cacheHits, throttled: env._dex.throttled,
+      dex: { requests: env._dex.requests, cacheHits: env._dex.cacheHits, sharedConfirmations: env._dex.sharedConfirmations, throttled: env._dex.throttled,
         retryAt: env._dex.retryAt || null }, paperSkipped: result.paper?.skipped || null };
     await statePut(env, JSON.stringify(status), "last_scan_status").catch(console.error);
     await scanProgress(env, "completed", at);
@@ -1826,6 +1826,26 @@ function passesMarketSafety(review) {
 }
 
 async function confirmMarketMomentum(call, initialPair, options = {}) {
+  const shared = options.env?._dex;
+  // Share the complete two-observation check, never just the refreshed price:
+  // using that price as both observations would silently weaken confirmation.
+  const key = JSON.stringify([options.chainId || "solana", call.contract,
+    options.dexId || null, initialPair?.pairAddress || null]);
+  if (!shared) return performMarketConfirmation(call, initialPair, options);
+  shared.confirmations ||= new Map();
+  let confirmation = shared.confirmations.get(key);
+  if (confirmation) shared.sharedConfirmations = num(shared.sharedConfirmations) + 1;
+  else {
+    confirmation = performMarketConfirmation(call, initialPair, options);
+    shared.confirmations.set(key, confirmation);
+  }
+  // Keep failures shared too: another source must not retry the same failed
+  // request during this scan. Each scan starts with a new confirmation map.
+  const result = await confirmation;
+  return { ...result, review: scorePair(call, result.pair, options.chainName || "Solana") };
+}
+
+async function performMarketConfirmation(call, initialPair, options = {}) {
   const chainId = options.chainId || "solana";
   const chainName = options.chainName || "Solana";
   const initialReview = scorePair(call, initialPair, chainName);
