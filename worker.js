@@ -1,5 +1,8 @@
 const CHANNEL = "SeekrTrending";
-const BUILD_ID = "scanner-v31-shared-confirmation-2026-10-01";
+const BUILD_ID = "scanner-v32-temporary-health-updates-2026-10-01";
+const HEALTH_UPDATE_CRONS = ["49,59 18 1 10 *", "9,19,29,39 19 1 10 *"];
+const HEALTH_UPDATE_START = Date.parse("2026-10-01T18:49:00Z");
+const HEALTH_UPDATE_END = Date.parse("2026-10-01T19:39:00Z");
 const MAX_MARKET_CAP = 3_000_000;
 const MAX_PUMPSWAP_MARKET_CAP = 2_000_000;
 const MIN_LIQUIDITY = 10_000;
@@ -102,9 +105,62 @@ export default {
   },
 
   async scheduled(_controller, env, ctx) {
+    if (HEALTH_UPDATE_CRONS.includes(_controller.cron)) {
+      // Separate from scan work and its lease: a stuck scan must still be reported.
+      return await sendTemporaryHealthUpdate(env, _controller.scheduledTime);
+    }
     return await runScan(env);
   },
 };
+
+async function sendTemporaryHealthUpdate(env, scheduledTime) {
+  const slot = Number(scheduledTime);
+  if (!Number.isFinite(slot) || slot < HEALTH_UPDATE_START || slot > HEALTH_UPDATE_END ||
+      (slot - HEALTH_UPDATE_START) % 600_000 !== 0 || Date.now() > HEALTH_UPDATE_END + 5 * 60_000) return;
+  const marker = "health_update_20261001_" + slot;
+  if (await stateGet(env, marker)) return;
+  const last = JSON.parse((await stateGet(env, "last_scan_status")) || "{}");
+  const progress = JSON.parse((await stateGet(env, "scan_progress")) || "{}");
+  await sendTelegram(env, formatScannerHealth(last, progress, slot));
+  await statePut(env, "sent", marker);
+}
+
+function formatScannerHealth(last, progress, slot, now = Date.now()) {
+  const finished = Date.parse(last.completedAt || last.at || "");
+  const stale = !Number.isFinite(finished) || now - finished > 6 * 60_000;
+  const sourceIssues = Object.entries(last.sources || {}).filter(([, source]) =>
+    source?.error || source?.skipped || num(source?.deferred) > 0 ||
+    (source?.results || []).some((result) => result.error || result.deferred));
+  const activeSourceIssues = sourceIssues.filter(([name]) => !["robinhood", "bnb"].includes(name));
+  const issues = [];
+  if (stale) issues.push("latest scan is stale or unavailable");
+  if (last.ok !== true || last.error) issues.push("scan failed or status unavailable");
+  if (num(last.seekrErrors)) issues.push(`${last.seekrErrors} Seekr error(s)`);
+  if (num(last.seekrPending)) issues.push(`${last.seekrPending} pending Seekr call(s)`);
+  if (num(last.seekrDeferred)) issues.push(`${last.seekrDeferred} deferred Seekr review(s)`);
+  if (num(last.dex?.throttled)) issues.push("DexScreener throttled during latest scan");
+  if (last.paperError || last.paperSkipped) issues.push("paper tracking interrupted");
+  if (last.skipped) issues.push(`scan skipped: ${last.skipped}`);
+  for (const [name, source] of activeSourceIssues) {
+    issues.push(`${name}: ${source.error || source.skipped || "failed or deferred reviews"}`);
+  }
+  if (progress.stage === "failed") issues.push("current scan failed");
+  const clock = (value) => new Date(value).toLocaleTimeString("en-US", {
+    timeZone: "America/Los_Angeles", hour: "numeric", minute: "2-digit" });
+  const lines = [
+    `<b>Scanner health — ${clock(slot)} Pacific</b>`,
+    issues.length ? "⚠️ Issues detected" : "✅ Latest scan clean",
+    `Latest completion: ${Number.isFinite(finished) ? clock(finished) + " Pacific" : "unavailable"}`,
+    `Seekr: ${num(last.seekrChecked)} checked; ${num(last.seekrPending)} pending; ${num(last.seekrErrors)} errors`,
+    `DexScreener: ${num(last.dex?.requests)} requests; ${num(last.dex?.throttled)} throttled`,
+    `Paper: ${esc(last.paperError || last.paperSkipped || "no reported interruption")}`,
+    `Progress: ${esc(progress.stage || "unavailable")}`,
+  ];
+  if (issues.length) lines.push(`Details: ${esc(issues.join("; "))}`);
+  lines.push("Latest scan snapshot; does not prove every opportunity was covered.");
+  if (slot === HEALTH_UPDATE_END) lines.push("Final temporary health update. Updates now stop.");
+  return lines.join("\n");
+}
 
 export class State {
   constructor(ctx) {
