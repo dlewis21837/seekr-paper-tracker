@@ -1,5 +1,5 @@
 const CHANNEL = "SeekrTrending";
-const BUILD_ID = "scanner-v32-temporary-health-updates-2026-10-01";
+const BUILD_ID = "scanner-v33-seekr-pumpswap-only-2026-10-01";
 const HEALTH_UPDATE_CRONS = ["49,59 18 1 10 *", "9,19,29,39 19 1 10 *"];
 const HEALTH_UPDATE_START = Date.parse("2026-10-01T18:49:00Z");
 const HEALTH_UPDATE_END = Date.parse("2026-10-01T19:39:00Z");
@@ -95,7 +95,7 @@ export default {
       return Response.json(buildPaperReport(positions, watch));
     }
     return Response.json({
-      status: "Seekr + Raydium + PumpSwap + Meteora Solana tracker online",
+      status: "Seekr + PumpSwap Solana tracker online",
       build: BUILD_ID,
       schedule: "Every 3 minutes, 5:00 a.m.–8:00 p.m. Pacific",
       configured: Boolean(env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID && env.STATE),
@@ -431,14 +431,14 @@ async function scan(env) {
   }
   await scanProgress(env, "solana-discovery");
   const solanaMomentum = scanHasTime(env, 45_000) ? await scanSolanaMomentum(env)
-    : { raydium: { skipped: "Scan time budget" }, pumpSwap: { skipped: "Scan time budget" }, meteora: { skipped: "Scan time budget" } };
+    : { raydium: disabledMomentumSource(), pumpSwap: { skipped: "Scan time budget" }, meteora: disabledMomentumSource() };
   const robinhood = { configured: false, checked: 0, skipped: "Solana-only mode" };
   const bnb = { configured: false, checked: 0, skipped: "Solana-only mode" };
   await scanProgress(env, "learning");
   const learning = scanHasTime(env, 20_000) ? await updateLearningOutcomes(env).catch((error) => ({ error: String(error) }))
     : { skipped: "Scan time budget" };
   if (connected) {
-    await sendTelegram(env, `✅ Seekr + Raydium + PumpSwap + Meteora Solana tracker connected. Build: <code>${BUILD_ID}</code>. Scanning every 3 minutes from 5:00 a.m. to 8:00 p.m. Pacific.`);
+    await sendTelegram(env, `✅ Seekr + PumpSwap Solana tracker connected. Build: <code>${BUILD_ID}</code>. Scanning every 3 minutes from 5:00 a.m. to 8:00 p.m. Pacific.`);
   }
   return { ok: true, build: BUILD_ID, seekrChecked: results.length, seekrDeferred: seekrDexDeferred ? seekrBatch.length : 0,
     seekrPending: pending.length,
@@ -524,7 +524,7 @@ async function getSolanaMomentumPayloads(env) {
       const quote = String(pair?.quoteToken?.address || "");
       if (!addresses.includes(contract) || !TRUSTED_SOLANA_QUOTES.has(quote)) continue;
       const dexId = String(pair?.dexId || "").toLowerCase();
-      if (!["pumpswap", "meteora", "raydium"].includes(dexId)) continue;
+      if (dexId !== "pumpswap") continue;
       const tokenId = `solana_${contract}`;
       included.set(tokenId, {
         id: tokenId,
@@ -554,12 +554,16 @@ async function getSolanaMomentumPayloads(env) {
   }
 }
 
+function disabledMomentumSource() {
+  return { configured: false, discovered: 0, checked: 0, skipped: "Disabled by user" };
+}
+
 async function scanSolanaMomentum(env) {
   const now = Date.now();
   const nextAttempt = Number(await stateGet(env, "solana_next_attempt")) || 0;
   if (now < nextAttempt) {
     const deferred = { discovered: 0, checked: 0, skipped: "Provider cooldown", retryAt: new Date(nextAttempt).toISOString() };
-    return { raydium: deferred, pumpSwap: deferred, meteora: deferred };
+    return { raydium: disabledMomentumSource(), pumpSwap: deferred, meteora: disabledMomentumSource() };
   }
   try {
     const discovery = await getSolanaMomentumPayloads(env);
@@ -570,29 +574,20 @@ async function scanSolanaMomentum(env) {
     const alertHistory = [...currentAlerts, ...legacyPumpSwapAlerts]
       .filter((item) => item?.contract && now - num(item.alertedAt) < PUMPSWAP_ALERT_COOLDOWN_MS)
       .filter((item, index, all) => all.findIndex((other) => other.contract === item.contract) === index);
-    // Run sequentially against shared history so the same token cannot alert once
-    // from Raydium, PumpSwap, and Meteora during a single scheduled scan.
-    const raydium = await processSolanaMomentumDex(env, payloads, {
-      dexId: "raydium",
-      source: "RAYDIUM",
-      fallbackName: "Raydium token",
-    }, alertHistory, now);
+    // Keep shared alert history when narrowing discovery to PumpSwap.
+    const raydium = disabledMomentumSource();
     const pumpSwap = await processSolanaMomentumDex(env, payloads, {
       dexId: "pumpswap",
       source: "PUMPSWAP",
       fallbackName: "PumpSwap token",
     }, alertHistory, now);
-    const meteora = await processSolanaMomentumDex(env, payloads, {
-      dexId: "meteora",
-      source: "METEORA",
-      fallbackName: "Meteora token",
-    }, alertHistory, now);
+    const meteora = disabledMomentumSource();
     await statePut(env, JSON.stringify(alertHistory.slice(-300)), "solana_momentum_alerted");
     return { raydium, pumpSwap, meteora };
   } catch (error) {
     await statePut(env, now + (String(error).includes("429") ? 15 : 9) * 60_000, "solana_next_attempt").catch(console.error);
     const failure = { discovered: 0, checked: 0, error: String(error) };
-    return { raydium: failure, pumpSwap: failure, meteora: failure };
+    return { raydium: disabledMomentumSource(), pumpSwap: failure, meteora: disabledMomentumSource() };
   }
 }
 
