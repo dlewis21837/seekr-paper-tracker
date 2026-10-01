@@ -1,5 +1,5 @@
 const CHANNEL = "SeekrTrending";
-const BUILD_ID = "scanner-v23-bounded-queue-2026-09-30";
+const BUILD_ID = "scanner-v24-provider-backoff-2026-09-30";
 const MAX_MARKET_CAP = 3_000_000;
 const MAX_PUMPSWAP_MARKET_CAP = 2_000_000;
 const MIN_LIQUIDITY = 10_000;
@@ -64,10 +64,12 @@ const STABLE_MINTS = new Set([
 const TRUSTED_SOLANA_QUOTES = new Set([SOL_MINT, ...STABLE_MINTS]);
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (url.pathname === "/run") {
-      const result = await runScan(env);
+      const running = runScan(env);
+      ctx.waitUntil(running);
+      const result = await running;
       return Response.json(result);
     }
     if (url.pathname === "/status") {
@@ -243,7 +245,7 @@ async function scan(env) {
       if (confirmation.passed) seekrSafetyChecks += 1;
       // A failed market gate cannot alert; avoid spending a safety API call on it.
       const safety = confirmation.passed
-        ? await getSolanaSafety(call.contract)
+        ? await getSolanaSafety(call.contract, env)
         : { passed: false, scorePenalty: 0, summary: "skipped: market gate failed" };
       if (safety.summary?.includes("safety report unavailable")) throw new Error(safety.summary);
       const effectiveScore = review.score - num(safety.scorePenalty);
@@ -276,7 +278,7 @@ async function scan(env) {
   if (connected) {
     await sendTelegram(env, `✅ Seekr + Raydium + PumpSwap + Meteora Solana tracker connected. Build: <code>${BUILD_ID}</code>. Scanning every 3 minutes from 5:00 a.m. to 8:00 p.m. Pacific.`);
   }
-  return { ok: true, build: BUILD_ID, seekrChecked: seekrBatch.length, seekrPending: pending.length,
+  return { ok: true, build: BUILD_ID, seekrChecked: results.length, seekrPending: pending.length,
     seekrRetryAt: Date.now() < (Number(await stateGet(env, "seekr_provider_retry_at")) || 0)
       ? new Date(Number(await stateGet(env, "seekr_provider_retry_at"))).toISOString() : null,
     seekrResults: results, ...solanaMomentum, robinhood, bnb, learning, paper };
@@ -286,9 +288,9 @@ async function fetchJsonWithRetry(url, options = {}, attempts = 3) {
   let lastError;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     try {
-      const response = await fetch(url, options);
+      const response = await fetch(url, { ...options, signal: AbortSignal.timeout(15_000) });
       if (response.ok) return response.json();
-      if (response.status !== 429 && response.status < 500) throw new Error(`HTTP ${response.status}`);
+      if (response.status !== 429 && response.status < 500) throw new Error(`${response.url ? new URL(response.url).hostname : "unknown provider"} HTTP ${response.status}`);
       const retryAfter = Number(response.headers.get("retry-after"));
       const delay = Number.isFinite(retryAfter) && retryAfter > 0
         ? Math.min(retryAfter * 1000, 10_000)
@@ -477,7 +479,7 @@ async function processSolanaMomentumDex(env, payloads, config, alertHistory, now
         // Do not spend a scarce Rugcheck request on a token that already failed
         // the market/momentum confirmation.
         const safety = confirmation.passed
-          ? await getSolanaSafety(call.contract)
+          ? await getSolanaSafety(call.contract, env)
           : { passed: false, scorePenalty: 0, summary: "skipped: market gate failed" };
         const effectiveScore = review.score - num(safety.scorePenalty);
         const alerted = Boolean(pair && safety.passed && confirmation.passed && effectiveScore >= MIN_SCORE && review.marketCap <= MAX_PUMPSWAP_MARKET_CAP);
@@ -778,7 +780,7 @@ async function scanRaydium(env) {
         const pair = await getBestPair(call.contract, "raydium");
         const confirmation = await confirmMarketMomentum(call, pair, { dexId: "raydium" });
         const review = confirmation.review;
-        const safety = await getSolanaSafety(call.contract);
+        const safety = await getSolanaSafety(call.contract, env);
         const effectiveScore = review.score - num(safety.scorePenalty);
         const alerted = Boolean(pair && safety.passed && confirmation.passed && effectiveScore >= MIN_SCORE && review.marketCap <= MAX_MARKET_CAP);
         if (alerted) {
@@ -1478,7 +1480,7 @@ async function getBestPair(contract, dexId = null, chainId = "solana") {
 async function getBestPairs(contracts, chainId) {
   const best = new Map();
   if (!contracts.length) return best;
-  const response = await fetch(`https://api.dexscreener.com/tokens/v1/${chainId}/${contracts.join(",")}`);
+  const response = await fetch(`https://api.dexscreener.com/tokens/v1/${chainId}/${contracts.join(",")}`, { signal: AbortSignal.timeout(15_000) });
   const pairs = await check(response).then((r) => r.json());
   const wanted = new Set(contracts.map((address) => address.toLowerCase()));
   for (const pair of Array.isArray(pairs) ? pairs : []) {
@@ -1492,17 +1494,30 @@ async function getBestPairs(contracts, chainId) {
   return best;
 }
 
-async function getSolanaSafety(contract) {
+async function getSolanaSafety(contract, env) {
+  const now = Date.now();
+  const key = "safety_" + contract;
+  if (env) {
+    const cached = JSON.parse((await stateGet(env, key)) || "null");
+    if (cached && cached.until > now) return cached.result;
+    const retryAt = Number(await stateGet(env, "rugcheck_retry_at")) || 0;
+    if (now < retryAt) return { passed: false, summary: "blocked: safety report unavailable (Rugcheck provider cooldown until " + new Date(retryAt).toISOString() + ")" };
+  }
   try {
     const response = await fetch(`https://api.rugcheck.xyz/v1/tokens/${contract}/report`, {
       headers: { "User-Agent": "SeekrSafetyGate/1.0" },
       signal: AbortSignal.timeout(15_000),
     });
     const data = await check(response).then((r) => r.json());
-    return reviewSolanaSafety(data);
+    const result = reviewSolanaSafety(data);
+    if (env) await statePut(env, JSON.stringify({ until: now + 60_000, result }), key);
+    return result;
   } catch (error) {
+    if (env && String(error).includes("429")) {
+      await statePut(env, Date.now() + 3 * 60_000, "rugcheck_retry_at");
+    }
     // Fail closed: an unavailable safety report must never become an alert.
-    return { passed: false, summary: `blocked: safety report unavailable (${String(error)})` };
+    return { passed: false, summary: `blocked: safety report unavailable (Rugcheck: ${String(error)})` };
   }
 }
 
