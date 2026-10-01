@@ -1,5 +1,6 @@
 const CHANNEL = "SeekrTrending";
-const BUILD_ID = "scanner-v33-seekr-pumpswap-only-2026-10-01";
+const PAPER_TRACKING_ENABLED = false;
+const BUILD_ID = "scanner-v34-paper-disabled-2026-10-01";
 const HEALTH_UPDATE_CRONS = ["49,59 18 1 10 *", "9,19,29,39 19 1 10 *"];
 const HEALTH_UPDATE_START = Date.parse("2026-10-01T18:49:00Z");
 const HEALTH_UPDATE_END = Date.parse("2026-10-01T19:39:00Z");
@@ -92,12 +93,13 @@ export default {
     if (url.pathname === "/paper") {
       const positions = parseJsonArray(await stateGet(env, "paper_positions"));
       const watch = parseJsonArray(await stateGet(env, "paper_watch"));
-      return Response.json(buildPaperReport(positions, watch));
+      return Response.json({ ...buildPaperReport(positions, watch), trackingEnabled: PAPER_TRACKING_ENABLED, recordsFrozen: !PAPER_TRACKING_ENABLED });
     }
     return Response.json({
       status: "Seekr + PumpSwap Solana tracker online",
       build: BUILD_ID,
       schedule: "Every 3 minutes, 5:00 a.m.–8:00 p.m. Pacific",
+      paperTrackingEnabled: PAPER_TRACKING_ENABLED,
       configured: Boolean(env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID && env.STATE),
       robinhoodConfigured: false,
       bnbConfigured: false,
@@ -154,7 +156,7 @@ function formatScannerHealth(last, progress, slot, now = Date.now()) {
     `Latest completion: ${Number.isFinite(finished) ? clock(finished) + " Pacific" : "unavailable"}`,
     `Seekr: ${num(last.seekrChecked)} checked; ${num(last.seekrPending)} pending; ${num(last.seekrErrors)} errors`,
     `DexScreener: ${num(last.dex?.requests)} requests; ${num(last.dex?.throttled)} throttled`,
-    `Paper: ${esc(last.paperError || last.paperSkipped || "no reported interruption")}`,
+    `Paper: ${last.paperEnabled === false ? "disabled" : esc(last.paperError || last.paperSkipped || "no reported interruption")}`,
     `Progress: ${esc(progress.stage || "unavailable")}`,
   ];
   if (issues.length) lines.push(`Details: ${esc(issues.join("; "))}`);
@@ -278,7 +280,7 @@ async function runScan(env) {
       seekrFailures: (result.seekrResults || []).filter((item) => item.error)
         .slice(0, 3).map((item) => ({ contract: item.contract, error: item.error })),
       sources: { raydium: result.raydium, pumpSwap: result.pumpSwap, meteora: result.meteora,
-        robinhood: result.robinhood, bnb: result.bnb }, paperError: result.paper?.error || null,
+        robinhood: result.robinhood, bnb: result.bnb }, paperError: result.paper?.error || null, paperEnabled: PAPER_TRACKING_ENABLED,
       error: result.error || null, skipped: result.skipped || null,
       dex: { requests: env._dex.requests, cacheHits: env._dex.cacheHits, sharedConfirmations: env._dex.sharedConfirmations, throttled: env._dex.throttled,
         retryAt: env._dex.retryAt || null }, paperSkipped: result.paper?.skipped || null };
@@ -312,17 +314,19 @@ async function scan(env) {
   }
   if (!insidePacificWindow()) {
     const learning = await updateLearningOutcomes(env).catch((error) => ({ error: String(error) }));
-    const paper = await updatePaperLedgerSafe(env);
-    await maybeSendDailyPaperReport(env, paper).catch(console.error);
+    const paper = PAPER_TRACKING_ENABLED ? await updatePaperLedgerSafe(env) : { disabled: true };
+    if (PAPER_TRACKING_ENABLED) await maybeSendDailyPaperReport(env, paper).catch(console.error);
     return { ok: true, skipped: "Outside active hours", learning, paper };
   }
 
-  // Price tracking must run before potentially slow discovery or safety checks.
-  env._dex && (env._dex.priority = "paper");
-  await scanProgress(env, "paper");
-  const paper = await updatePaperLedgerSafe(env);
+  // Paper tracking is disabled; discovery proceeds without paper price requests.
+  if (PAPER_TRACKING_ENABLED) {
+    env._dex && (env._dex.priority = "paper");
+    await scanProgress(env, "paper");
+  }
+  const paper = PAPER_TRACKING_ENABLED ? await updatePaperLedgerSafe(env) : { disabled: true };
   env._dex && (env._dex.priority = "discovery");
-  await maybeSendDailyPaperReport(env, paper).catch(console.error);
+  if (PAPER_TRACKING_ENABLED) await maybeSendDailyPaperReport(env, paper).catch(console.error);
   await scanProgress(env, "seekr-feed");
   const html = await fetch(`https://t.me/s/${CHANNEL}`, {
     signal: AbortSignal.timeout(15_000),
@@ -1142,6 +1146,7 @@ async function loadPaperEntryHistory(env, positions) {
 }
 
 async function recordPaperWatch(env, call, review) {
+  if (!PAPER_TRACKING_ENABLED) return;
   const now = Date.now();
   const watch = firstPaperRecords(parseJsonArray(await stateGet(env, "paper_watch")), "alertedAt");
   const positions = firstPaperRecords(parseJsonArray(await stateGet(env, "paper_positions")), "entryAt");
@@ -1214,6 +1219,7 @@ async function recordPaperWatch(env, call, review) {
 }
 
 async function updatePaperLedgerSafe(env) {
+  if (!PAPER_TRACKING_ENABLED) return { disabled: true };
   try {
     return await updatePaperLedger(env);
   } catch (error) {
@@ -1225,6 +1231,7 @@ async function updatePaperLedgerSafe(env) {
 }
 
 async function updatePaperLedger(env) {
+  if (!PAPER_TRACKING_ENABLED) return { disabled: true };
   const now = Date.now();
   const nextAttempt = Number(await stateGet(env, "paper_next_attempt")) || 0;
   if (now < nextAttempt) {
@@ -1570,6 +1577,7 @@ function formatDailyPaperCoinMessages(positions, date) {
 }
 
 async function maybeSendDailyPaperReport(env, report) {
+  if (!PAPER_TRACKING_ENABLED) return;
   if (!report?.totals) return;
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone: "America/Los_Angeles",
