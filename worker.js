@@ -155,8 +155,12 @@ export class State {
       const token = await request.text();
       const acquired = await this.storage.transaction(async (tx) => {
         const lease = await tx.get("scan_lease");
-        if (lease && lease.until > Date.now()) return false;
-        await tx.put("scan_lease", { token, until: Date.now() + 10 * 60_000 });
+        const now = Date.now();
+        // Older builds used ten-minute leases. Bound orphaned legacy leases as
+        // well, so a terminated paper update cannot suppress several cron runs.
+        const startedAt = lease?.startedAt ?? (lease ? lease.until - 10 * 60_000 : 0);
+        if (lease && Math.min(lease.until, startedAt + 4 * 60_000) > now) return false;
+        await tx.put("scan_lease", { token, startedAt: now, until: now + 4 * 60_000 });
         return true;
       });
       return Response.json({ acquired });
