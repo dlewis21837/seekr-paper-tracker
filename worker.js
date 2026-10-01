@@ -131,7 +131,8 @@ function formatScannerHealth(last, progress, slot, now = Date.now()) {
   const sourceIssues = Object.entries(last.sources || {}).filter(([, source]) =>
     source?.error || source?.skipped || num(source?.deferred) > 0 ||
     (source?.results || []).some((result) => result.error || result.deferred));
-  const activeSourceIssues = sourceIssues.filter(([name]) => !["robinhood", "bnb"].includes(name));
+  const activeSourceIssues = sourceIssues.filter(([name, source]) =>
+    !["robinhood", "bnb"].includes(name) && source?.skipped !== "Disabled by user");
   const issues = [];
   if (stale) issues.push("latest scan is stale or unavailable");
   if (last.ok !== true || last.error) issues.push("scan failed or status unavailable");
