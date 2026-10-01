@@ -1,5 +1,5 @@
 const CHANNEL = "SeekrTrending";
-const BUILD_ID = "scanner-v28-bounded-scans-progress-2026-10-01";
+const BUILD_ID = "scanner-v29-lightweight-paper-reports-2026-10-01";
 const MAX_MARKET_CAP = 3_000_000;
 const MAX_PUMPSWAP_MARKET_CAP = 2_000_000;
 const MIN_LIQUIDITY = 10_000;
@@ -1172,10 +1172,11 @@ async function updatePaperLedger(env) {
   const now = Date.now();
   const nextAttempt = Number(await stateGet(env, "paper_next_attempt")) || 0;
   if (now < nextAttempt) {
-    return { ...buildPaperReport(parseJsonArray(await stateGet(env, "paper_positions")),
+    return { ...paperScanResult(parseJsonArray(await stateGet(env, "paper_positions")),
       parseJsonArray(await stateGet(env, "paper_watch"))), skipped: "Provider cooldown",
       retryAt: new Date(nextAttempt).toISOString() };
   }
+  if (env._scanDeadline) await scanProgress(env, "paper-load");
   const watch = firstPaperRecords(parseJsonArray(await stateGet(env, "paper_watch")), "alertedAt");
   const positions = firstPaperRecords(parseJsonArray(await stateGet(env, "paper_positions")), "entryAt");
   const history = await loadPaperEntryHistory(env, positions);
@@ -1184,6 +1185,7 @@ async function updatePaperLedger(env) {
   );
   const open = positions.filter((item) => item?.contract && item.status === "open");
   const tracked = [...open, ...watching];
+  if (env._scanDeadline) await scanProgress(env, "paper-quotes");
   const pairs = new Map();
   for (const chainId of [...new Set(tracked.map((item) => item.chainId || "solana"))]) {
     const contracts = [...new Set(tracked.filter((item) => (item.chainId || "solana") === chainId).map((item) => item.contract))];
@@ -1193,6 +1195,7 @@ async function updatePaperLedger(env) {
     }
   }
 
+  if (env._scanDeadline) await scanProgress(env, "paper-apply");
   for (const item of watching) {
     const chainId = item.chainId || "solana";
     const pair = pairs.get(`${chainId}:${String(item.contract).toLowerCase()}`);
@@ -1284,13 +1287,14 @@ async function updatePaperLedger(env) {
   for (const item of watch) {
     if (item.status === "watching" && now - num(item.alertedAt) > PAPER_WATCH_WINDOW_MS) item.status = "expired";
   }
+  if (env._scanDeadline) await scanProgress(env, "paper-save");
   await statePut(env, now + 9 * 60_000, "paper_next_attempt");
   await statePut(env, JSON.stringify([...history]), "paper_entry_history");
   const savedPositions = positions.slice(-PAPER_RECORD_LIMIT);
   const savedWatch = watch.slice(-PAPER_RECORD_LIMIT);
   await statePut(env, JSON.stringify(savedPositions), "paper_positions");
   await statePut(env, JSON.stringify(savedWatch), "paper_watch");
-  return buildPaperReport(savedPositions, savedWatch);
+  return paperScanResult(savedPositions, savedWatch);
 }
 
 function closePaperPosition(position, reason, multiple, now) {
@@ -1331,20 +1335,35 @@ function applyPaperExitRules(position, multiple, now) {
   }
 }
 
+const PAPER_DATE_FORMATTER = new Intl.DateTimeFormat("en-CA", {
+  timeZone: "America/Los_Angeles", year: "numeric", month: "2-digit", day: "2-digit",
+});
+
 function paperPacificDate(timestamp) {
-  return new Intl.DateTimeFormat("en-CA", {
-    timeZone: "America/Los_Angeles", year: "numeric", month: "2-digit", day: "2-digit",
-  }).format(new Date(timestamp));
+  return PAPER_DATE_FORMATTER.format(new Date(timestamp));
 }
 
-function buildPaperReport(positions, watch, entryDate = null) {
+function paperScanResult(positions, watch) {
+  // Report generation is only needed for the scheduled evening delivery.
+  const hour = Number(new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/Los_Angeles", hour: "numeric", hourCycle: "h23",
+  }).formatToParts(new Date()).find((part) => part.type === "hour")?.value || 0);
+  if (hour >= 20) return buildPaperReport(positions, watch);
+  return { updated: true, trackedPositions: positions.length, watchedCalls: watch.length };
+}
+
+function buildPaperReport(positions, watch, entryDate = null, dateCache = new Map()) {
+  const dateFor = (timestamp) => {
+    if (!dateCache.has(timestamp)) dateCache.set(timestamp, paperPacificDate(timestamp));
+    return dateCache.get(timestamp);
+  };
   positions = firstPaperRecords(positions, "entryAt");
   watch = firstPaperRecords(watch, "alertedAt");
   const allPositions = positions;
   const allWatch = watch;
   if (entryDate) {
-    positions = positions.filter((item) => paperPacificDate(num(item.entryAt)) === entryDate);
-    watch = watch.filter((item) => paperPacificDate(num(item.alertedAt)) === entryDate);
+    positions = positions.filter((item) => dateFor(num(item.entryAt)) === entryDate);
+    watch = watch.filter((item) => dateFor(num(item.alertedAt)) === entryDate);
   }
   const strategyPositions = positions.filter((item) => item.strategyVersion === PAPER_STRATEGY_VERSION);
   const strategyClosed = strategyPositions.filter((item) => item.status !== "open");
@@ -1373,10 +1392,10 @@ function buildPaperReport(positions, watch, entryDate = null) {
     scope: entryDate ? "Entries opened on this Pacific date" : "Cumulative retained entries",
     entryDate,
     ...(entryDate ? {} : {
-      daily: buildPaperReport(allPositions, allWatch, paperPacificDate(Date.now())),
-      days: [...new Set(allPositions.map((item) => paperPacificDate(num(item.entryAt))))]
+      daily: buildPaperReport(allPositions, allWatch, dateFor(Date.now()), dateCache),
+      days: [...new Set(allPositions.map((item) => dateFor(num(item.entryAt))))]
         .sort().reverse().map((date) => {
-          const day = buildPaperReport(allPositions, allWatch, date);
+          const day = buildPaperReport(allPositions, allWatch, date, dateCache);
           return { date, totals: day.totals, strategy: day.strategy, cohorts: day.cohorts };
         }),
     }),
@@ -1452,7 +1471,7 @@ function formatPaperCoinBlock(item) {
   const multiple = open ? num(item.currentMultiple) : num(item.exitMultiple);
   const lines = [
     `<b>${esc(item.name || "Unknown")}</b> — ${esc(item.status)}`,
-    `Initial mcap: ${usd(num(item.entryMarketCap))} | Entry day: ${paperPacificDate(num(item.entryAt))}`,
+    `Initial mcap: ${usd(num(item.entryMarketCap))} | Entry day: ${dateFor(num(item.entryAt))}`,
     `${open ? "Latest" : "Exit"} mcap: ${usd(marketCap)} (${multiple.toFixed(2)}×) | Observed peak: ${peak.toFixed(2)}×`,
     `Reached: ${milestones.length ? milestones.join(", ") : "Below 2×"}`,
     paperProfitDetail(item),
