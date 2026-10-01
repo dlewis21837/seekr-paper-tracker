@@ -1,5 +1,5 @@
 const CHANNEL = "SeekrTrending";
-const BUILD_ID = "scanner-v29-lightweight-paper-reports-2026-10-01";
+const BUILD_ID = "scanner-v30-three-minute-discovery-2026-10-01";
 const MAX_MARKET_CAP = 3_000_000;
 const MAX_PUMPSWAP_MARKET_CAP = 2_000_000;
 const MIN_LIQUIDITY = 10_000;
@@ -508,7 +508,7 @@ async function scanSolanaMomentum(env) {
   try {
     const discovery = await getSolanaMomentumPayloads(env);
     const payloads = discovery.payloads;
-    await statePut(env, now + 9 * 60_000, "solana_next_attempt");
+    await statePut(env, now + 3 * 60_000, "solana_next_attempt");
     const currentAlerts = parseJsonArray(await stateGet(env, "solana_momentum_alerted"));
     const legacyPumpSwapAlerts = parseJsonArray(await stateGet(env, "pumpswap_alerted"));
     const alertHistory = [...currentAlerts, ...legacyPumpSwapAlerts]
