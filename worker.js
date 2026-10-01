@@ -1,5 +1,5 @@
 const CHANNEL = "SeekrTrending";
-const BUILD_ID = "scanner-v27-fast-safe-queue-drain-2026-10-01";
+const BUILD_ID = "scanner-v28-bounded-scans-progress-2026-10-01";
 const MAX_MARKET_CAP = 3_000_000;
 const MAX_PUMPSWAP_MARKET_CAP = 2_000_000;
 const MIN_LIQUIDITY = 10_000;
@@ -73,7 +73,14 @@ export default {
       return Response.json(result);
     }
     if (url.pathname === "/status") {
-      return Response.json(JSON.parse((await stateGet(env, "last_scan_status")) || "{}"));
+      const [completed, progress] = await Promise.all([
+        stateGet(env, "last_scan_status"), stateGet(env, "scan_progress")
+      ]);
+      const last = JSON.parse(completed || "{}");
+      const active = JSON.parse(progress || "{}");
+      return Response.json({ ...last, build: BUILD_ID, lastCompletedAt: last.completedAt || last.at || null,
+        stale: !last.at || Date.now() - Date.parse(last.completedAt || last.at) > 6 * 60_000,
+        progress: active });
     }
     if (url.pathname === "/learning") {
       const records = parseJsonArray(await stateGet(env, "learning_records"));
@@ -95,7 +102,7 @@ export default {
   },
 
   async scheduled(_controller, env, ctx) {
-    ctx.waitUntil(runScan(env));
+    return await runScan(env);
   },
 };
 
@@ -182,16 +189,18 @@ function safeStateKey(value) {
 
 async function stateGet(env, key = "last_message_id") {
   const stub = env.STATE.get(env.STATE.idFromName("seekr"));
-  return stub.fetch(`https://state/get?key=${encodeURIComponent(key)}`).then((r) => r.text());
+  return stub.fetch(`https://state/get?key=${encodeURIComponent(key)}`, { signal: AbortSignal.timeout(10_000) }).then(check).then((r) => r.text());
 }
 
 async function statePut(env, value, key = "last_message_id") {
   const stub = env.STATE.get(env.STATE.idFromName("seekr"));
-  await stub.fetch(`https://state/put?key=${encodeURIComponent(key)}`, { method: "POST", body: String(value) });
+  const response = await stub.fetch(`https://state/put?key=${encodeURIComponent(key)}`, { method: "POST", body: String(value), signal: AbortSignal.timeout(10_000) });
+  await check(response);
+  await response.text();
 }
 
 async function runScan(env) {
-  env = { ...env, _dex: { cache: new Map(), requests: 0, cacheHits: 0, throttled: 0, priority: "discovery" } };
+  env = { ...env, _scanDeadline: Date.now() + 150_000, _dex: { cache: new Map(), requests: 0, cacheHits: 0, throttled: 0, priority: "discovery" } };
   const at = new Date().toISOString();
   if (!env.STATE) return { ok: false, at, error: "Missing STATE binding" };
   const stub = env.STATE.get(env.STATE.idFromName("seekr"));
@@ -199,8 +208,9 @@ async function runScan(env) {
   const lease = await stub.fetch("https://state/acquire", { method: "POST", body: token }).then((r) => r.json());
   if (!lease.acquired) return { ok: true, at, skipped: "Scan already running" };
   try {
+    await scanProgress(env, "starting", at);
     const result = await scan(env);
-    const status = { at, ok: result.ok, seekrChecked: result.seekrChecked ?? 0,
+    const status = { at, completedAt: new Date().toISOString(), ok: result.ok, seekrChecked: result.seekrChecked ?? 0,
       seekrErrors: (result.seekrResults || []).filter((item) => item.error).length,
       seekrDeferred: result.seekrDeferred ?? 0,
       seekrPending: result.seekrPending ?? 0, seekrRetryAt: result.seekrRetryAt || null,
@@ -212,15 +222,27 @@ async function runScan(env) {
       dex: { requests: env._dex.requests, cacheHits: env._dex.cacheHits, throttled: env._dex.throttled,
         retryAt: env._dex.retryAt || null }, paperSkipped: result.paper?.skipped || null };
     await statePut(env, JSON.stringify(status), "last_scan_status").catch(console.error);
+    await scanProgress(env, "completed", at);
     return result;
   } catch (error) {
-    const result = { ok: false, at, error: String(error) };
+    const result = { ok: false, at, completedAt: new Date().toISOString(), error: String(error) };
     console.error("Scan failed", error);
+    await scanProgress(env, "failed", at, String(error)).catch(console.error);
     await statePut(env, JSON.stringify(result), "last_scan_status").catch(console.error);
     return result;
   } finally {
-    await stub.fetch("https://state/release", { method: "POST", body: token }).catch(console.error);
+    await stub.fetch("https://state/release", { method: "POST", body: token, signal: AbortSignal.timeout(10_000) }).then((r) => r.text()).catch(console.error);
   }
+}
+
+async function scanProgress(env, stage, startedAt = env._scanStartedAt, error = null) {
+  env._scanStartedAt = startedAt;
+  await statePut(env, JSON.stringify({ stage, startedAt, updatedAt: new Date().toISOString(),
+    deadlineAt: new Date(env._scanDeadline).toISOString(), error }), "scan_progress");
+}
+
+function scanHasTime(env, reserveMs = 0) {
+  return !env?._scanDeadline || Date.now() + reserveMs < env._scanDeadline;
 }
 
 async function scan(env) {
@@ -236,9 +258,11 @@ async function scan(env) {
 
   // Price tracking must run before potentially slow discovery or safety checks.
   env._dex && (env._dex.priority = "paper");
+  await scanProgress(env, "paper");
   const paper = await updatePaperLedgerSafe(env);
   env._dex && (env._dex.priority = "discovery");
   await maybeSendDailyPaperReport(env, paper).catch(console.error);
+  await scanProgress(env, "seekr-feed");
   const html = await fetch(`https://t.me/s/${CHANNEL}`, {
     signal: AbortSignal.timeout(15_000),
     headers: { "User-Agent": "Mozilla/5.0 SeekrTracker/1.0" },
@@ -281,8 +305,10 @@ async function scan(env) {
       }
     }
   }
+  await scanProgress(env, "seekr-reviews");
   let seekrSafetyChecks = 0;
   for (const call of seekrDexDeferred ? [] : seekrBatch) {
+    if (!scanHasTime(env, 55_000)) break;
     try {
       const pair = await getBestPair(call.contract, null, "solana", env);
       // After the one expensive safety slot is used, cheaply drain obvious
@@ -308,9 +334,9 @@ async function scan(env) {
         await statePut(env, JSON.stringify(pending), "seekr_pending_calls");
         continue;
       }
+      if (passesMarketSafety(scorePair(call, pair, "Solana"))) seekrSafetyChecks += 1;
       const confirmation = await confirmMarketMomentum(call, pair, { env });
       const review = confirmation.review;
-      if (confirmation.passed) seekrSafetyChecks += 1;
       // A failed market gate cannot alert; avoid spending a safety API call on it.
       const safety = confirmation.passed
         ? await getSolanaSafety(call.contract, env)
@@ -343,10 +369,14 @@ async function scan(env) {
       }
     }
   }
-  const solanaMomentum = await scanSolanaMomentum(env);
+  await scanProgress(env, "solana-discovery");
+  const solanaMomentum = scanHasTime(env, 45_000) ? await scanSolanaMomentum(env)
+    : { raydium: { skipped: "Scan time budget" }, pumpSwap: { skipped: "Scan time budget" }, meteora: { skipped: "Scan time budget" } };
   const robinhood = { configured: false, checked: 0, skipped: "Solana-only mode" };
   const bnb = { configured: false, checked: 0, skipped: "Solana-only mode" };
-  const learning = await updateLearningOutcomes(env).catch((error) => ({ error: String(error) }));
+  await scanProgress(env, "learning");
+  const learning = scanHasTime(env, 20_000) ? await updateLearningOutcomes(env).catch((error) => ({ error: String(error) }))
+    : { skipped: "Scan time budget" };
   if (connected) {
     await sendTelegram(env, `✅ Seekr + Raydium + PumpSwap + Meteora Solana tracker connected. Build: <code>${BUILD_ID}</code>. Scanning every 3 minutes from 5:00 a.m. to 8:00 p.m. Pacific.`);
   }
@@ -563,6 +593,7 @@ async function processSolanaMomentumDex(env, payloads, config, alertHistory, now
       .slice(0, 2);
     const results = [];
     for (const call of candidates) {
+      if (!scanHasTime(env, 45_000)) break;
       try {
         const pair = await getBestPair(call.contract, config.dexId, "solana", env);
         const confirmation = await confirmMarketMomentum(call, pair, { dexId: config.dexId, env });
@@ -586,7 +617,7 @@ async function processSolanaMomentumDex(env, payloads, config, alertHistory, now
         results.push({ contract: call.contract, error: String(error) });
       }
     }
-    return { discovered: tokens.size, checked: candidates.length, results };
+    return { discovered: tokens.size, checked: results.length, deferred: candidates.length - results.length, results };
   } catch (error) {
     return { discovered: 0, checked: 0, error: String(error) };
   }
@@ -1604,6 +1635,7 @@ async function dexJson(env, url, options = {}) {
   if (!env?.STATE) throw new Error("DexScreener request governor requires STATE");
   const stub = env.STATE.get(env.STATE.idFromName("seekr"));
   for (;;) {
+    if (!scanHasTime(env)) throw new Error("Scan time budget exhausted; queued work retained");
     const permit = await stub.fetch("https://state/dex-permit", {
       method: "POST", body: JSON.stringify({ priority: env._dex?.priority || "discovery" })
     }).then((r) => r.json());
@@ -1625,7 +1657,7 @@ async function dexJson(env, url, options = {}) {
     throw new Error("api.dexscreener.com HTTP 429; shared cooldown until " + new Date(backoff.retryAt).toISOString());
   }
   if (response.ok) {
-    await stub.fetch("https://state/dex-success", { method: "POST" }).catch(() => {});
+    await stub.fetch("https://state/dex-success", { method: "POST", signal: AbortSignal.timeout(10_000) }).then((r) => r.text()).catch(() => {});
   }
   return check(response).then((r) => r.json());
 }
@@ -1868,6 +1900,7 @@ function formatAlert(call, pair, r) {
 async function sendTelegram(env, text) {
   const response = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: "POST",
+    signal: AbortSignal.timeout(15_000),
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       chat_id: env.TELEGRAM_CHAT_ID,
@@ -1877,6 +1910,8 @@ async function sendTelegram(env, text) {
     }),
   });
   await check(response);
+  const receipt = await response.json();
+  if (!receipt.ok) throw new Error("Telegram delivery failed: " + (receipt.description || "unknown error"));
 }
 
 function money(value) {
