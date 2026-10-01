@@ -1475,7 +1475,7 @@ function formatPaperCoinBlock(item) {
   const multiple = open ? num(item.currentMultiple) : num(item.exitMultiple);
   const lines = [
     `<b>${esc(item.name || "Unknown")}</b> — ${esc(item.status)}`,
-    `Initial mcap: ${usd(num(item.entryMarketCap))} | Entry day: ${dateFor(num(item.entryAt))}`,
+    `Initial mcap: ${usd(num(item.entryMarketCap))} | Entry day: ${paperPacificDate(num(item.entryAt))}`,
     `${open ? "Latest" : "Exit"} mcap: ${usd(marketCap)} (${multiple.toFixed(2)}×) | Observed peak: ${peak.toFixed(2)}×`,
     `Reached: ${milestones.length ? milestones.join(", ") : "Below 2×"}`,
     paperProfitDetail(item),
