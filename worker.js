@@ -1,5 +1,5 @@
 const CHANNEL = "SeekrTrending";
-const BUILD_ID = "scanner-v24-provider-backoff-2026-09-30";
+const BUILD_ID = "scanner-v25-shared-dex-budget-2026-09-30";
 const MAX_MARKET_CAP = 3_000_000;
 const MAX_PUMPSWAP_MARKET_CAP = 2_000_000;
 const MIN_LIQUIDITY = 10_000;
@@ -106,6 +106,35 @@ export class State {
 
   async fetch(request) {
     const url = new URL(request.url);
+    if (url.pathname === "/dex-permit" && request.method === "POST") {
+      const { priority } = await request.json();
+      const result = await this.storage.transaction(async (tx) => {
+        const now = Date.now();
+        const budget = (await tx.get("dex_budget")) || {};
+        if (num(budget.retryAt) > now) return { allowed: false, retryAt: budget.retryAt, reason: "DexScreener provider cooldown" };
+        if (now - num(budget.windowAt) >= 60_000) { budget.windowAt = now; budget.count = 0; }
+        const limit = priority === "paper" ? 40 : 30;
+        if (num(budget.count) >= limit) return { allowed: false, retryAt: budget.windowAt + 60_000, reason: "DexScreener request budget" };
+        if (num(budget.nextAt) > now) return { allowed: false, waitMs: budget.nextAt - now };
+        budget.count = num(budget.count) + 1;
+        budget.nextAt = now + 1_000;
+        await tx.put("dex_budget", budget);
+        return { allowed: true };
+      });
+      return Response.json(result);
+    }
+    if (url.pathname === "/dex-backoff" && request.method === "POST") {
+      const { retryAfterMs } = await request.json();
+      const result = await this.storage.transaction(async (tx) => {
+        const budget = (await tx.get("dex_budget")) || {};
+        budget.strikes = Math.min(4, num(budget.strikes) + 1);
+        const delay = Math.min(15 * 60_000, Math.max(num(retryAfterMs), 60_000 * (2 ** (budget.strikes - 1))));
+        budget.retryAt = Math.max(num(budget.retryAt), Date.now() + delay);
+        await tx.put("dex_budget", budget);
+        return { retryAt: budget.retryAt };
+      });
+      return Response.json(result);
+    }
     if (url.pathname === "/acquire" && request.method === "POST") {
       const token = await request.text();
       const acquired = await this.storage.transaction(async (tx) => {
@@ -153,6 +182,7 @@ async function statePut(env, value, key = "last_message_id") {
 }
 
 async function runScan(env) {
+  env = { ...env, _dex: { cache: new Map(), requests: 0, cacheHits: 0, throttled: 0, priority: "discovery" } };
   const at = new Date().toISOString();
   if (!env.STATE) return { ok: false, at, error: "Missing STATE binding" };
   const stub = env.STATE.get(env.STATE.idFromName("seekr"));
@@ -168,7 +198,9 @@ async function runScan(env) {
         .slice(0, 3).map((item) => ({ contract: item.contract, error: item.error })),
       sources: { raydium: result.raydium, pumpSwap: result.pumpSwap, meteora: result.meteora,
         robinhood: result.robinhood, bnb: result.bnb }, paperError: result.paper?.error || null,
-      error: result.error || null, skipped: result.skipped || null };
+      error: result.error || null, skipped: result.skipped || null,
+      dex: { requests: env._dex.requests, cacheHits: env._dex.cacheHits, throttled: env._dex.throttled,
+        retryAt: env._dex.retryAt || null }, paperSkipped: result.paper?.skipped || null };
     await statePut(env, JSON.stringify(status), "last_scan_status").catch(console.error);
     return result;
   } catch (error) {
@@ -193,7 +225,9 @@ async function scan(env) {
   }
 
   // Price tracking must run before potentially slow discovery or safety checks.
+  env._dex && (env._dex.priority = "paper");
   const paper = await updatePaperLedgerSafe(env);
+  env._dex && (env._dex.priority = "discovery");
   await maybeSendDailyPaperReport(env, paper).catch(console.error);
   const html = await fetch(`https://t.me/s/${CHANNEL}`, {
     signal: AbortSignal.timeout(15_000),
@@ -224,13 +258,16 @@ async function scan(env) {
   const results = [];
   const seekrRetryAt = Number(await stateGet(env, "seekr_provider_retry_at")) || 0;
   const seekrBatch = Date.now() < seekrRetryAt ? [] : pending.slice(0, 15);
+  if (seekrBatch.length) {
+    await getBestPairs(seekrBatch.map((call) => call.contract), "solana", env).catch(() => {});
+  }
   let seekrSafetyChecks = 0;
   for (const call of seekrBatch) {
     try {
       // Bound slow 20-second confirmations to one Seekr candidate per scan.
       if (seekrSafetyChecks >= 1) break;
-      const pair = await getBestPair(call.contract);
-      const confirmation = await confirmMarketMomentum(call, pair);
+      const pair = await getBestPair(call.contract, null, "solana", env);
+      const confirmation = await confirmMarketMomentum(call, pair, { env });
       const review = confirmation.review;
       // Drain market-gate failures quickly, but reserve Rugcheck to one call per
       // scheduled scan so provider throttling cannot freeze the whole queue.
@@ -305,9 +342,13 @@ async function fetchJsonWithRetry(url, options = {}, attempts = 3) {
   throw lastError || new Error("Request failed");
 }
 
-async function getSolanaMomentumPayloads() {
+async function getSolanaMomentumPayloads(env) {
+  const requestJson = (url, options = {}, attempts = 3) =>
+    new URL(url).hostname === "api.dexscreener.com"
+      ? dexJson(env, url, options)
+      : fetchJsonWithRetry(url, options, attempts);
   try {
-    const payload = await fetchJsonWithRetry(
+    const payload = await requestJson(
       "https://api.geckoterminal.com/api/v2/networks/solana/trending_pools?include=base_token&page=1",
       { headers: { "User-Agent": "SeekrSolanaMomentum/1.1", Accept: "application/json" } },
       2
@@ -315,10 +356,10 @@ async function getSolanaMomentumPayloads() {
     return { payloads: [payload], source: "geckoterminal" };
   } catch (geckoError) {
     const [profileResult, boostResult] = await Promise.allSettled([
-      fetchJsonWithRetry("https://api.dexscreener.com/token-profiles/recent-updates/v1", {
+      requestJson("https://api.dexscreener.com/token-profiles/recent-updates/v1", {
         headers: { "User-Agent": "SeekrSolanaMomentum/1.1", Accept: "application/json" },
       }, 2),
-      fetchJsonWithRetry("https://api.dexscreener.com/token-boosts/latest/v1", {
+      requestJson("https://api.dexscreener.com/token-boosts/latest/v1", {
         headers: { "User-Agent": "SeekrSolanaMomentum/1.1", Accept: "application/json" },
       }, 2),
     ]);
@@ -331,7 +372,7 @@ async function getSolanaMomentumPayloads() {
       .filter((address) => /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(address))
     )].slice(0, 30);
     if (!addresses.length) throw new Error(`GeckoTerminal unavailable (${String(geckoError)}); DexScreener fallback returned no Solana tokens`);
-    const pairs = await fetchJsonWithRetry(
+    const pairs = await requestJson(
       `https://api.dexscreener.com/tokens/v1/solana/${addresses.join(",")}`,
       { headers: { "User-Agent": "SeekrSolanaMomentum/1.1", Accept: "application/json" } },
       2
@@ -381,7 +422,7 @@ async function scanSolanaMomentum(env) {
     return { raydium: deferred, pumpSwap: deferred, meteora: deferred };
   }
   try {
-    const discovery = await getSolanaMomentumPayloads();
+    const discovery = await getSolanaMomentumPayloads(env);
     const payloads = discovery.payloads;
     await statePut(env, now + 9 * 60_000, "solana_next_attempt");
     const currentAlerts = parseJsonArray(await stateGet(env, "solana_momentum_alerted"));
@@ -473,8 +514,8 @@ async function processSolanaMomentumDex(env, payloads, config, alertHistory, now
     const results = [];
     for (const call of candidates) {
       try {
-        const pair = await getBestPair(call.contract, config.dexId);
-        const confirmation = await confirmMarketMomentum(call, pair, { dexId: config.dexId });
+        const pair = await getBestPair(call.contract, config.dexId, "solana", env);
+        const confirmation = await confirmMarketMomentum(call, pair, { dexId: config.dexId, env });
         const review = confirmation.review;
         // Do not spend a scarce Rugcheck request on a token that already failed
         // the market/momentum confirmation.
@@ -522,7 +563,7 @@ async function scanBnb(env) {
     const candidates = [...watch.values()].slice(0, 20);
     const contracts = candidates.map((item) => item.contract);
     const [pairs, safeties] = await Promise.all([
-      getBestPairs(contracts, BNB_CHAIN_ID),
+      getBestPairs(contracts, BNB_CHAIN_ID, env),
       getBnbSafeties(contracts),
     ]);
     for (const item of candidates) {
@@ -531,7 +572,7 @@ async function scanBnb(env) {
         const pair = pairs.get(key) || null;
         const safety = safeties.get(key) || { passed: false, summary: "GoPlus data unavailable" };
         const call = { ...item, name: item.name || pair?.baseToken?.name || pair?.baseToken?.symbol || "BNB token", paid: false, source: "BNB" };
-        const confirmation = await confirmMarketMomentum(call, pair, { chainId: BNB_CHAIN_ID, chainName: "BNB Chain" });
+        const confirmation = await confirmMarketMomentum(call, pair, { chainId: BNB_CHAIN_ID, chainName: "BNB Chain", env });
         const review = confirmation.review;
         if (pair && safety.passed && confirmation.passed && review.score >= BNB_MIN_SCORE && review.marketCap <= MAX_MARKET_CAP) {
           await sendTelegram(env, formatAlert(call, confirmation.pair, { ...review, safety, confirmation }));
@@ -667,9 +708,9 @@ async function scanRobinhood(env) {
     for (const item of [...watch.values()].slice(0, 40)) {
       const key = item.contract.toLowerCase();
       try {
-        const pair = await getBestPair(item.contract, null, ROBINHOOD_CHAIN_ID);
+        const pair = await getBestPair(item.contract, null, ROBINHOOD_CHAIN_ID, env);
         const call = { ...item, name: pair?.baseToken?.name || pair?.baseToken?.symbol || "Robinhood token", paid: false, source: "ROBINHOOD" };
-        const confirmation = await confirmMarketMomentum(call, pair, { chainId: ROBINHOOD_CHAIN_ID, chainName: "Robinhood Chain" });
+        const confirmation = await confirmMarketMomentum(call, pair, { chainId: ROBINHOOD_CHAIN_ID, chainName: "Robinhood Chain", env });
         const review = confirmation.review;
         if (pair && confirmation.passed && review.score >= ROBINHOOD_MIN_SCORE && review.marketCap <= MAX_MARKET_CAP) {
           await sendTelegram(env, formatAlert(call, confirmation.pair, { ...review, confirmation }));
@@ -777,8 +818,8 @@ async function scanRaydium(env) {
     const results = [];
     for (const call of fresh) {
       try {
-        const pair = await getBestPair(call.contract, "raydium");
-        const confirmation = await confirmMarketMomentum(call, pair, { dexId: "raydium" });
+        const pair = await getBestPair(call.contract, "raydium", "solana", env);
+        const confirmation = await confirmMarketMomentum(call, pair, { dexId: "raydium", env });
         const review = confirmation.review;
         const safety = await getSolanaSafety(call.contract, env);
         const effectiveScore = review.score - num(safety.scorePenalty);
@@ -870,7 +911,7 @@ async function updateLearningOutcomes(env) {
   const contracts = [...new Set(active.map((record) => record.contract))];
   const pairs = new Map();
   for (let i = 0; i < contracts.length; i += 30) {
-    const batch = await getBestPairs(contracts.slice(i, i + 30), "solana");
+    const batch = await getBestPairs(contracts.slice(i, i + 30), "solana", env);
     for (const [contract, pair] of batch) pairs.set(contract, pair);
   }
   const checkpoints = [
@@ -1061,12 +1102,12 @@ async function updatePaperLedger(env) {
     item?.contract && item.status === "watching" && now - num(item.alertedAt) <= PAPER_WATCH_WINDOW_MS
   );
   const open = positions.filter((item) => item?.contract && item.status === "open");
-  const tracked = [...watching, ...open];
+  const tracked = [...open, ...watching];
   const pairs = new Map();
   for (const chainId of [...new Set(tracked.map((item) => item.chainId || "solana"))]) {
     const contracts = [...new Set(tracked.filter((item) => (item.chainId || "solana") === chainId).map((item) => item.contract))];
     for (let i = 0; i < contracts.length; i += 30) {
-      const batch = await getBestPairs(contracts.slice(i, i + 30), chainId);
+      const batch = await getBestPairs(contracts.slice(i, i + 30), chainId, env);
       for (const [contract, pair] of batch) pairs.set(`${chainId}:${contract}`, pair);
     }
   }
@@ -1445,9 +1486,18 @@ function parseCalls(html) {
   return calls;
 }
 
-async function getBestPair(contract, dexId = null, chainId = "solana") {
-  const response = await fetch(`https://api.dexscreener.com/token-pairs/v1/${chainId}/${contract}`, { signal: AbortSignal.timeout(15_000) });
-  const data = await check(response).then((r) => r.json());
+async function getBestPair(contract, dexId = null, chainId = "solana", env, forceFresh = false) {
+  const key = chainId + ":" + contract;
+  let data = !forceFresh && env?._dex?.cache.get(key);
+  if (data) env._dex.cacheHits += 1;
+  else {
+    data = await dexJson(env, `https://api.dexscreener.com/token-pairs/v1/${chainId}/${contract}`);
+    env?._dex?.cache.set(key, data);
+  }
+  return selectBestPair(data, contract, dexId, chainId);
+}
+
+function selectBestPair(data, contract, dexId = null, chainId = "solana") {
   let pairs = (Array.isArray(data) ? data : []).filter((p) =>
     p.chainId === chainId && (!dexId || String(p.dexId).toLowerCase().includes(dexId))
   );
@@ -1477,21 +1527,54 @@ async function getBestPair(contract, dexId = null, chainId = "solana") {
   return pairs.sort((a, b) => num(b.liquidity?.usd) - num(a.liquidity?.usd))[0] || null;
 }
 
-async function getBestPairs(contracts, chainId) {
+async function getBestPairs(contracts, chainId, env) {
   const best = new Map();
-  if (!contracts.length) return best;
-  const response = await fetch(`https://api.dexscreener.com/tokens/v1/${chainId}/${contracts.join(",")}`, { signal: AbortSignal.timeout(15_000) });
-  const pairs = await check(response).then((r) => r.json());
-  const wanted = new Set(contracts.map((address) => address.toLowerCase()));
-  for (const pair of Array.isArray(pairs) ? pairs : []) {
-    for (const address of [pair?.baseToken?.address, pair?.quoteToken?.address]) {
-      const key = String(address || "").toLowerCase();
-      if (!wanted.has(key)) continue;
-      const current = best.get(key);
-      if (!current || num(pair?.liquidity?.usd) > num(current?.liquidity?.usd)) best.set(key, pair);
+  const addresses = [...new Set(contracts)];
+  const missing = addresses.filter((address) => !env?._dex?.cache.has(chainId + ":" + address));
+  const local = new Map();
+  for (let i = 0; i < missing.length; i += 30) {
+    const batch = missing.slice(i, i + 30);
+    const pairs = await dexJson(env, `https://api.dexscreener.com/tokens/v1/${chainId}/${batch.join(",")}`);
+    for (const address of batch) {
+      const data = (Array.isArray(pairs) ? pairs : []).filter((pair) => pair.chainId === chainId && pair.baseToken?.address === address);
+      local.set(address, data);
+      env?._dex?.cache.set(chainId + ":" + address, data);
     }
   }
+  for (const address of addresses) {
+    const data = local.get(address) || env?._dex?.cache.get(chainId + ":" + address) || [];
+    if (!local.has(address) && env?._dex) env._dex.cacheHits += 1;
+    const pair = selectBestPair(data, address, null, chainId);
+    if (pair) best.set(address.toLowerCase(), pair);
+  }
   return best;
+}
+
+async function dexJson(env, url, options = {}) {
+  if (!env?.STATE) throw new Error("DexScreener request governor requires STATE");
+  const stub = env.STATE.get(env.STATE.idFromName("seekr"));
+  for (;;) {
+    const permit = await stub.fetch("https://state/dex-permit", {
+      method: "POST", body: JSON.stringify({ priority: env._dex?.priority || "discovery" })
+    }).then((r) => r.json());
+    if (permit.allowed) break;
+    if (permit.waitMs) { await new Promise((resolve) => setTimeout(resolve, Math.min(permit.waitMs, 1_000))); continue; }
+    if (env._dex) { env._dex.throttled += 1; env._dex.retryAt = new Date(permit.retryAt).toISOString(); }
+    throw new Error(permit.reason + " until " + new Date(permit.retryAt).toISOString());
+  }
+  if (env._dex) env._dex.requests += 1;
+  const response = await fetch(url, { ...options, signal: AbortSignal.timeout(15_000) });
+  if (response.status === 429) {
+    const header = response.headers.get("retry-after");
+    const seconds = Number(header);
+    const retryAfterMs = header && Number.isFinite(seconds) ? seconds * 1_000 : Math.max(0, Date.parse(header) - Date.now()) || 0;
+    const backoff = await stub.fetch("https://state/dex-backoff", {
+      method: "POST", body: JSON.stringify({ retryAfterMs })
+    }).then((r) => r.json());
+    if (env._dex) { env._dex.throttled += 1; env._dex.retryAt = new Date(backoff.retryAt).toISOString(); }
+    throw new Error("api.dexscreener.com HTTP 429; shared cooldown until " + new Date(backoff.retryAt).toISOString());
+  }
+  return check(response).then((r) => r.json());
 }
 
 async function getSolanaSafety(contract, env) {
@@ -1644,7 +1727,7 @@ async function confirmMarketMomentum(call, initialPair, options = {}) {
 
   // A candidate must remain healthy across two observations before Telegram receives it.
   await new Promise((resolve) => setTimeout(resolve, FINAL_CONFIRM_DELAY_MS));
-  const freshPair = await getBestPair(call.contract, options.dexId || null, chainId);
+  const freshPair = await getBestPair(call.contract, options.dexId || null, chainId, options.env, true);
   const freshReview = scorePair(call, freshPair, chainName);
   if (!passesMarketSafety(freshReview)) {
     return { passed: false, pair: freshPair, review: freshReview, initialReview, summary: "blocked by final momentum gate" };
