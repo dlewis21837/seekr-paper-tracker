@@ -1,5 +1,5 @@
 const CHANNEL = "SeekrTrending";
-const BUILD_ID = "scanner-v26-clean-dex-circuit-breaker-2026-10-01";
+const BUILD_ID = "scanner-v27-fast-safe-queue-drain-2026-10-01";
 const MAX_MARKET_CAP = 3_000_000;
 const MAX_PUMPSWAP_MARKET_CAP = 2_000_000;
 const MIN_LIQUIDITY = 10_000;
@@ -284,21 +284,32 @@ async function scan(env) {
   let seekrSafetyChecks = 0;
   for (const call of seekrDexDeferred ? [] : seekrBatch) {
     try {
-      // Bound slow 20-second confirmations to one Seekr candidate per scan.
-      if (seekrSafetyChecks >= 1) break;
       const pair = await getBestPair(call.contract, null, "solana", env);
-      const confirmation = await confirmMarketMomentum(call, pair, { env });
-      const review = confirmation.review;
-      // Drain market-gate failures quickly, but reserve Rugcheck to one call per
-      // scheduled scan so provider throttling cannot freeze the whole queue.
-      if (confirmation.passed && seekrSafetyChecks >= 1) {
-        results.push({ contract: call.contract, deferred: true, marketGate: confirmation.summary,
-          reason: "waiting for per-scan safety budget" });
-        const deferredIndex = pending.findIndex((item) => item.id === call.id);
-        if (deferredIndex >= 0) pending.push(...pending.splice(deferredIndex, 1));
+      // After the one expensive safety slot is used, cheaply drain obvious
+      // market failures and rotate plausible candidates to the next scan.
+      if (seekrSafetyChecks >= 1) {
+        const initialReview = scorePair(call, pair, "Solana");
+        if (passesMarketSafety(initialReview)) {
+          results.push({ contract: call.contract, deferred: true,
+            marketGate: "initial market gate passed; waiting for next safety slot" });
+          const deferredIndex = pending.findIndex((item) => item.id === call.id);
+          if (deferredIndex >= 0) pending.push(...pending.splice(deferredIndex, 1));
+          await statePut(env, JSON.stringify(pending), "seekr_pending_calls");
+          continue;
+        }
+        const confirmation = { passed: false, pair, review: initialReview,
+          initialReview, summary: "blocked by initial momentum gate" };
+        const safety = { passed: false, scorePenalty: 0, summary: "skipped: market gate failed" };
+        results.push({ contract: call.contract, alerted: false, score: initialReview.score,
+          rawScore: initialReview.score, safety: safety.summary, marketGate: confirmation.summary });
+        await recordLearningObservation(env, call, initialReview, safety, confirmation, false).catch(() => {});
+        const failedIndex = pending.findIndex((item) => item.id === call.id);
+        if (failedIndex >= 0) pending.splice(failedIndex, 1);
         await statePut(env, JSON.stringify(pending), "seekr_pending_calls");
         continue;
       }
+      const confirmation = await confirmMarketMomentum(call, pair, { env });
+      const review = confirmation.review;
       if (confirmation.passed) seekrSafetyChecks += 1;
       // A failed market gate cannot alert; avoid spending a safety API call on it.
       const safety = confirmation.passed
