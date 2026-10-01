@@ -295,7 +295,7 @@ async function fetchJsonWithRetry(url, options = {}, attempts = 3) {
       const delay = Number.isFinite(retryAfter) && retryAfter > 0
         ? Math.min(retryAfter * 1000, 10_000)
         : 1_000 * (2 ** attempt);
-      lastError = new Error(`HTTP ${response.status}`);
+      lastError = new Error(`${response.url ? new URL(response.url).hostname : "unknown provider"} HTTP ${response.status}`);
       if (attempt + 1 < attempts) await new Promise((resolve) => setTimeout(resolve, delay));
     } catch (error) {
       lastError = error;
@@ -1767,4 +1767,4 @@ function marketCapTier(value) {
 function usd(value) { return Number.isFinite(value) ? `$${Math.round(value).toLocaleString("en-US")}` : "n/a"; }
 function esc(value) { return String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
 function parseJsonArray(value) { try { const v = JSON.parse(value || "[]"); return Array.isArray(v) ? v : []; } catch { return []; } }
-async function check(response) { if (!response.ok) throw new Error(`HTTP ${response.status}`); return response; }
+async function check(response) { if (!response.ok) throw new Error(`${response.url ? new URL(response.url).hostname : "unknown provider"} HTTP ${response.status}`); return response; }
