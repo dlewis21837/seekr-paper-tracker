@@ -20,3 +20,17 @@ test('Trial expires position using sampled price',()=>{assert.equal(mark(trade()
 test('Status and runs require separate secret',async()=>{
  assert.equal((await worker.fetch(new Request('https://test/run',{method:'POST'}),{})).status,401);
 });
+
+import {allowance,extractCandidates} from './solana-feed.mjs';
+test('Feed ends after seven days and blocks requests above budget or before cooldown',()=>{
+ assert.equal(allowance({},now),null);
+ assert.ok(allowance({startedAt:now-7*86400000},now));
+ assert.ok(allowance({requests:2200},now));
+ assert.ok(allowance({nextAt:now+1},now));
+ assert.equal(allowance({requests:2199,nextAt:now},now),null);
+});
+test('Feed uses documented mint field and rejects other pools or unknown schema',()=>{
+ const t={mint:SOL,market:'pumpfun-amm',quoteToken:SOL,marketCapUsd:50000,liquidityUsd:20000};
+ assert.deepEqual(extractCandidates({status:'success',data:[t,t,{...t,market:'meteora'}]}),[SOL]);
+ assert.throws(()=>extractCandidates({data:[]}));
+});
