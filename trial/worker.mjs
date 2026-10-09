@@ -1,4 +1,5 @@
-import { State, stateGet, statePut, getSolanaMomentumPayloads, getBestPair, getSolanaSafety, insidePacificWindow } from './scanner-base.mjs';
+import { discover } from './solana-feed.mjs';
+import { State, stateGet, statePut, getBestPair, getSolanaSafety, insidePacificWindow } from './scanner-base.mjs';
 export { State };
 export const SOL = 'So11111111111111111111111111111111111111112';
 export function gate(p, now = Date.now()) {
@@ -49,18 +50,12 @@ async function run(env) {
     if (!insidePacificWindow()) result.skipped = 'Outside 5am–8pm Pacific entry window';
     else if (trades.length >= 100 || trades.filter(t => !t.closedAt).length >= 10) result.skipped = 'Trial capacity reached';
     else {
-      const discovery = await getSolanaMomentumPayloads(env);
+      const discovery = await discover(env);
       result.discovery = discovery.source;
-      const candidates = [];
-      for (const payload of discovery.payloads) {
-        const tokens = new Map((payload.included || []).map(t => [t.id,t.attributes]));
-        for (const p of payload.data || []) {
-          if (p.relationships?.dex?.data?.id !== 'pumpswap') continue;
-          const id = p.relationships?.base_token?.data?.id;
-          const contract = tokens.get(id)?.address || String(id || '').replace(/^solana_/, '');
-          if (/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(contract) && !trades.some(t => t.contract === contract)) candidates.push(contract);
-        }
-      }
+      result.feedBudget = discovery.budget;
+      result.skipped = discovery.skipped || null;
+      const candidates = discovery.candidates.filter(contract => !trades.some(t => t.contract === contract));
+      result.discovered = candidates.length;
       for (const contract of [...new Set(candidates)].slice(0, 4)) {
         if (Date.now()+35000 >= env._scanDeadline) break;
         try {
@@ -96,7 +91,7 @@ export default {
     if (!env.RUN_KEY || req.headers.get('Authorization') !== `Bearer ${env.RUN_KEY}`) return new Response('Unauthorized',{status:401});
     const path = new URL(req.url).pathname;
     if (path === '/run' && req.method === 'POST') return Response.json(await run(env));
-    if (path === '/status') return Response.json(await jsonGet(env,'trial_status',{}));
+    if (path === '/status') return Response.json({...await jsonGet(env,'trial_status',{}), feedBudget:await jsonGet(env,'free_feed_budget',{})});
     if (path === '/results') return Response.json({mode:'SIMULATION',trades:await jsonGet(env,'trial_trades',[])});
     return new Response('Not found',{status:404});
   },
