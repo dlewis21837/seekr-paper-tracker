@@ -1,8 +1,23 @@
+// Trigger a fresh trial build
 {
   "name": "pumpswap-low-cap-trial",
   "main": "worker.mjs",
   "compatibility_date": "2026-10-09",
-  "triggers": {"crons": ["*/3 * * * *"]},
-  "durable_objects": {"bindings": [{"name":"STATE","class_name":"State"}]},
-  "migrations": [{"tag":"v1","new_sqlite_classes":["State"]}]
+  "triggers": {
+    "crons": ["*/3 * * * *"]
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "STATE",
+        "class_name": "State"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["State"]
+    }
+  ]
 }
