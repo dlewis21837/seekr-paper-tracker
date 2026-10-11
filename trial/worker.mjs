@@ -45,6 +45,46 @@ async function jsonGet(env, key, fallback) {
   return JSON.parse(await stateGet(env, key) || JSON.stringify(fallback));
 }
 
+
+function escapeHtml(v) { return String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+export function formatTrialAlert(t) {
+  const link = 'https://dexscreener.com/solana/' + encodeURIComponent(t.contract);
+  return ['🧪 <b>PUMPSWAP LOW-CAP — ' + escapeHtml(t.name) + '</b>',
+    'Confirmed candidate • simulation trial',
+    'Market cap: $' + Math.round(Number(t.entryCap)).toLocaleString('en-US'),
+    'Safety: ' + escapeHtml(t.safety),
+    'CA: <a href="' + link + '">' + escapeHtml(t.contract) + '</a>',
+    'Simulated entry only; no purchase was made.'].join('\n');
+}
+async function deliverTrialAlerts(env, trades, result) {
+  if (!insidePacificWindow()) return;
+  const pending = trades.filter(t => t.alertState === 'pending' && !t.closedAt);
+  if (!pending.length) return;
+  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
+    result.errors.push({error:'Trial alerts require TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID'});
+    return;
+  }
+  for (const t of pending) {
+    try {
+      const response = await fetch('https://api.telegram.org/bot' + env.TELEGRAM_BOT_TOKEN + '/sendMessage', {
+        method:'POST', signal:AbortSignal.timeout(15000),
+        headers:{'content-type':'application/json'},
+        body:JSON.stringify({chat_id:env.TELEGRAM_CHAT_ID,text:formatTrialAlert(t),
+          parse_mode:'HTML',disable_web_page_preview:true})
+      });
+      const receipt = await response.json();
+      if (!response.ok || !receipt.ok) throw new Error('Telegram delivery failed: ' + (receipt.description || response.status));
+      t.alertState = 'sent'; t.alertSentAt = Date.now(); delete t.alertError;
+      await statePut(env,JSON.stringify(trades),'trial_trades');
+      result.alertsSent.push(t.contract);
+    } catch(e) {
+      t.alertError = String(e);
+      result.errors.push({contract:t.contract,error:String(e)});
+      await statePut(env,JSON.stringify(trades),'trial_trades');
+    }
+  }
+}
+
 async function run(env) {
   console.log('TRIAL_SCAN_START', new Date().toISOString());
   const stub = env.STATE.get(env.STATE.idFromName('seekr'));
@@ -66,7 +106,7 @@ async function run(env) {
     }
   };
   const result = {
-    at: new Date(now).toISOString(), mode: 'SIMULATION', opened: [], errors: []
+    at: new Date(now).toISOString(), mode: 'SIMULATION', opened: [], alertsSent: [], errors: []
   };
   try {
     const trades = await jsonGet(env, 'trial_trades', []);
@@ -126,7 +166,7 @@ async function run(env) {
             entryAt: now, entryCap: first.marketCap,
             entryPrice: Number(first.priceUsd) * 1.02,
             remaining: 1, realized: 0, peak: 1,
-            multiple: .98 / 1.02, safety: safety.summary
+            multiple: .98 / 1.02, safety: safety.summary, alertState: 'pending'
           });
           result.opened.push(contract);
           await statePut(env, JSON.stringify(trades), 'trial_trades');
@@ -136,6 +176,7 @@ async function run(env) {
         }
       }
     }
+    await deliverTrialAlerts(env, trades, result);
     result.ok = !result.errors.length;
   } catch (e) {
     result.ok = false;
