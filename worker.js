@@ -1,6 +1,6 @@
 const CHANNEL = "SeekrTrending";
 const PAPER_TRACKING_ENABLED = false;
-const BUILD_ID = "scanner-v37-token-pair-recovery-2026-10-12";
+const BUILD_ID = "scanner-v38-provider-gateway-2026-10-12";
 const HEALTH_UPDATE_CRONS = ["49,59 18 1 10 *", "9,19,29,39 19 1 10 *"];
 const HEALTH_UPDATE_START = Date.parse("2026-10-01T18:49:00Z");
 const HEALTH_UPDATE_END = Date.parse("2026-10-01T19:39:00Z");
@@ -180,6 +180,18 @@ export class State {
 
   async fetch(request) {
     const url = new URL(request.url);
+    if (url.pathname === "/provider-fetch" && request.method === "POST") {
+      const { url: target, headers = {} } = await request.json();
+      const targetUrl = new URL(target);
+      if (targetUrl.protocol !== "https:" || !["api.dexscreener.com", "api.geckoterminal.com", "api.rugcheck.xyz"].includes(targetUrl.hostname)) {
+        return new Response("Provider not allowed", { status: 400 });
+      }
+      const response = await fetch(targetUrl.href, { headers: {
+        Accept: "application/json", "User-Agent": "SeekrScanner/1.0 (+https://github.com/dlewis21837/seekr-paper-tracker)",
+        ...headers
+      }, signal: AbortSignal.timeout(15_000) });
+      return response;
+    }
     if (url.pathname === "/dex-permit" && request.method === "POST") {
       const { priority, bucket } = await request.json();
       const budgetKey = bucket === "discovery" ? "dex_discovery_budget" : "dex_pairs_budget";
@@ -482,6 +494,15 @@ async function persistSeekrDexRetry(env) {
   await statePut(env, Number.isFinite(retryAt) ? retryAt + 1_000 : fallback, "seekr_provider_retry_at");
 }
 
+async function providerFetch(env, url, options = {}) {
+  if (!env?.STATE) return fetch(url, { ...options, signal: AbortSignal.timeout(15_000) });
+  const gateway = env.STATE.get(env.STATE.idFromName("provider_gateway_wnam_v1"), { locationHint: "wnam" });
+  return gateway.fetch("https://state/provider-fetch", {
+    method: "POST", body: JSON.stringify({ url, headers: options.headers || {} }),
+    signal: AbortSignal.timeout(20_000)
+  });
+}
+
 async function fetchJsonWithRetry(url, options = {}, attempts = 3) {
   let lastError;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
@@ -507,7 +528,7 @@ async function getSolanaMomentumPayloads(env) {
   const requestJson = (url, options = {}, attempts = 1) =>
     new URL(url).hostname === "api.dexscreener.com"
       ? dexJson(env, url, options)
-      : fetchJsonWithRetry(url, options, attempts);
+      : providerFetch(env, url, options).then(check).then((r) => r.json());
   try {
     const geckoRetryAt = Number(await stateGet(env, "gecko_provider_retry_at")) || 0;
     if (Date.now() < geckoRetryAt) throw new Error("GeckoTerminal provider cooldown until " + new Date(geckoRetryAt).toISOString());
@@ -1752,7 +1773,7 @@ async function dexJson(env, url, options = {}) {
     throw new Error(permit.reason + " until " + new Date(permit.retryAt).toISOString());
   }
   if (env._dex) env._dex.requests += 1;
-  const response = await fetch(url, { ...options, signal: AbortSignal.timeout(15_000) });
+  const response = await providerFetch(env, url, options);
   await statePut(env, JSON.stringify({ at: new Date().toISOString(),
     path: new URL(url).pathname, status: response.status, bucket,
     retryAfter: response.headers.get("retry-after"), server: response.headers.get("server"),
@@ -1785,7 +1806,7 @@ async function getSolanaSafety(contract, env) {
     if (now < retryAt) return { passed: false, summary: "blocked: safety report unavailable (Rugcheck provider cooldown until " + new Date(retryAt).toISOString() + ")" };
   }
   try {
-    const response = await fetch(`https://api.rugcheck.xyz/v1/tokens/${contract}/report`, {
+    const response = await providerFetch(env, `https://api.rugcheck.xyz/v1/tokens/${contract}/report`, {
       headers: { "User-Agent": "SeekrSafetyGate/1.0" },
       signal: AbortSignal.timeout(15_000),
     });
