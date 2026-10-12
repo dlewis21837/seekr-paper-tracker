@@ -1,6 +1,6 @@
 const CHANNEL = "SeekrTrending";
 const PAPER_TRACKING_ENABLED = false;
-const BUILD_ID = "scanner-v34-paper-disabled-2026-10-01";
+const BUILD_ID = "scanner-v35-provider-isolation-2026-10-12";
 const HEALTH_UPDATE_CRONS = ["49,59 18 1 10 *", "9,19,29,39 19 1 10 *"];
 const HEALTH_UPDATE_START = Date.parse("2026-10-01T18:49:00Z");
 const HEALTH_UPDATE_END = Date.parse("2026-10-01T19:39:00Z");
@@ -173,10 +173,11 @@ export class State {
   async fetch(request) {
     const url = new URL(request.url);
     if (url.pathname === "/dex-permit" && request.method === "POST") {
-      const { priority } = await request.json();
+      const { priority, bucket } = await request.json();
+      const budgetKey = bucket === "discovery" ? "dex_discovery_budget" : "dex_pairs_budget";
       const result = await this.storage.transaction(async (tx) => {
         const now = Date.now();
-        const budget = (await tx.get("dex_budget")) || {};
+        const budget = (await tx.get(budgetKey)) || (await tx.get("dex_budget")) || {};
         if (num(budget.retryAt) > now) return { allowed: false, retryAt: budget.retryAt, reason: "DexScreener provider cooldown" };
         if (now - num(budget.windowAt) >= 60_000) { budget.windowAt = now; budget.count = 0; }
         const limit = priority === "paper" ? 40 : 30;
@@ -184,29 +185,32 @@ export class State {
         if (num(budget.nextAt) > now) return { allowed: false, waitMs: budget.nextAt - now };
         budget.count = num(budget.count) + 1;
         budget.nextAt = now + 1_000;
-        await tx.put("dex_budget", budget);
+        await tx.put(budgetKey, budget);
         return { allowed: true };
       });
       return Response.json(result);
     }
     if (url.pathname === "/dex-backoff" && request.method === "POST") {
-      const { retryAfterMs } = await request.json();
+      const { retryAfterMs, bucket } = await request.json();
+      const budgetKey = bucket === "discovery" ? "dex_discovery_budget" : "dex_pairs_budget";
       const result = await this.storage.transaction(async (tx) => {
-        const budget = (await tx.get("dex_budget")) || {};
+        const budget = (await tx.get(budgetKey)) || (await tx.get("dex_budget")) || {};
         budget.strikes = Math.min(4, num(budget.strikes) + 1);
         const delay = Math.min(15 * 60_000, Math.max(num(retryAfterMs), 60_000 * (2 ** (budget.strikes - 1))));
         budget.retryAt = Math.max(num(budget.retryAt), Date.now() + delay);
-        await tx.put("dex_budget", budget);
+        await tx.put(budgetKey, budget);
         return { retryAt: budget.retryAt };
       });
       return Response.json(result);
     }
     if (url.pathname === "/dex-success" && request.method === "POST") {
+      const { bucket } = await request.json();
+      const budgetKey = bucket === "discovery" ? "dex_discovery_budget" : "dex_pairs_budget";
       await this.storage.transaction(async (tx) => {
-        const budget = (await tx.get("dex_budget")) || {};
+        const budget = (await tx.get(budgetKey)) || (await tx.get("dex_budget")) || {};
         budget.strikes = 0;
         budget.retryAt = 0;
-        await tx.put("dex_budget", budget);
+        await tx.put(budgetKey, budget);
       });
       return new Response("ok");
     }
@@ -349,7 +353,7 @@ async function scan(env) {
   const pendingById = new Map(savedPending.filter((c) => c?.id && c?.contract).map((c) => [c.id, c]));
   for (const call of fresh) pendingById.set(call.id, call);
   // Keep one pending review per exact token; repeated source posts must not inflate the queue.
-  const pending = [...pendingById.values()].sort((a, b) => a.id - b.id)
+  const pending = [...fresh.slice().reverse(), ...pendingById.values()]
     .filter((call, index, all) => all.findIndex((item) => item.contract === call.contract) === index);
   // Save calls before moving the cursor so an interrupted scan cannot lose them.
   await statePut(env, JSON.stringify(pending), "seekr_pending_calls");
@@ -488,20 +492,24 @@ async function fetchJsonWithRetry(url, options = {}, attempts = 3) {
 }
 
 async function getSolanaMomentumPayloads(env) {
-  const requestJson = (url, options = {}, attempts = 3) =>
+  const requestJson = (url, options = {}, attempts = 1) =>
     new URL(url).hostname === "api.dexscreener.com"
       ? dexJson(env, url, options)
       : fetchJsonWithRetry(url, options, attempts);
   try {
+    const geckoRetryAt = Number(await stateGet(env, "gecko_provider_retry_at")) || 0;
+    if (Date.now() < geckoRetryAt) throw new Error("GeckoTerminal provider cooldown until " + new Date(geckoRetryAt).toISOString());
     const payload = await requestJson(
       "https://api.geckoterminal.com/api/v2/networks/solana/trending_pools?include=base_token&page=1",
       { headers: { "User-Agent": "SeekrSolanaMomentum/1.1", Accept: "application/json" } },
-      2
+      1
     );
+    await statePut(env, 0, "gecko_provider_retry_at");
     return { payloads: [payload], source: "geckoterminal" };
   } catch (geckoError) {
+    if (String(geckoError).includes("HTTP 429")) await statePut(env, Date.now() + 3 * 60_000, "gecko_provider_retry_at");
     const [profileResult, boostResult] = await Promise.allSettled([
-      requestJson("https://api.dexscreener.com/token-profiles/recent-updates/v1", {
+      requestJson("https://api.dexscreener.com/token-profiles/latest/v1", {
         headers: { "User-Agent": "SeekrSolanaMomentum/1.1", Accept: "application/json" },
       }, 2),
       requestJson("https://api.dexscreener.com/token-boosts/latest/v1", {
@@ -590,7 +598,8 @@ async function scanSolanaMomentum(env) {
     await statePut(env, JSON.stringify(alertHistory.slice(-300)), "solana_momentum_alerted");
     return { raydium, pumpSwap, meteora };
   } catch (error) {
-    await statePut(env, now + (String(error).includes("429") ? 15 : 9) * 60_000, "solana_next_attempt").catch(console.error);
+    const providerRetryAt = Date.parse(env?._dex?.retryAt || "");
+    await statePut(env, Math.max(now + 3 * 60_000, Number.isFinite(providerRetryAt) ? providerRetryAt + 1_000 : 0), "solana_next_attempt").catch(console.error);
     const failure = { discovered: 0, checked: 0, error: String(error) };
     return { raydium: disabledMomentumSource(), pumpSwap: failure, meteora: disabledMomentumSource() };
   }
@@ -1717,10 +1726,11 @@ async function getBestPairs(contracts, chainId, env) {
 async function dexJson(env, url, options = {}) {
   if (!env?.STATE) throw new Error("DexScreener request governor requires STATE");
   const stub = env.STATE.get(env.STATE.idFromName("seekr"));
+  const bucket = /^\/(token-profiles|token-boosts|community-takeovers|ads|orders)\//.test(new URL(url).pathname) ? "discovery" : "pairs";
   for (;;) {
     if (!scanHasTime(env)) throw new Error("Scan time budget exhausted; queued work retained");
     const permit = await stub.fetch("https://state/dex-permit", {
-      method: "POST", body: JSON.stringify({ priority: env._dex?.priority || "discovery" })
+      method: "POST", body: JSON.stringify({ priority: env._dex?.priority || "discovery", bucket })
     }).then((r) => r.json());
     if (permit.allowed) break;
     if (permit.waitMs) { await new Promise((resolve) => setTimeout(resolve, Math.min(permit.waitMs, 1_000))); continue; }
@@ -1734,13 +1744,13 @@ async function dexJson(env, url, options = {}) {
     const seconds = Number(header);
     const retryAfterMs = header && Number.isFinite(seconds) ? seconds * 1_000 : Math.max(0, Date.parse(header) - Date.now()) || 0;
     const backoff = await stub.fetch("https://state/dex-backoff", {
-      method: "POST", body: JSON.stringify({ retryAfterMs })
+      method: "POST", body: JSON.stringify({ retryAfterMs, bucket })
     }).then((r) => r.json());
     if (env._dex) { env._dex.throttled += 1; env._dex.retryAt = new Date(backoff.retryAt).toISOString(); }
     throw new Error("api.dexscreener.com HTTP 429; shared cooldown until " + new Date(backoff.retryAt).toISOString());
   }
   if (response.ok) {
-    await stub.fetch("https://state/dex-success", { method: "POST", signal: AbortSignal.timeout(10_000) }).then((r) => r.text()).catch(() => {});
+    await stub.fetch("https://state/dex-success", { method: "POST", body: JSON.stringify({ bucket }), signal: AbortSignal.timeout(10_000) }).then((r) => r.text()).catch(() => {});
   }
   return check(response).then((r) => r.json());
 }
