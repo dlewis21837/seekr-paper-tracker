@@ -1,6 +1,6 @@
 const CHANNEL = "SeekrTrending";
 const PAPER_TRACKING_ENABLED = false;
-const BUILD_ID = "scanner-v35-provider-isolation-2026-10-12";
+const BUILD_ID = "scanner-v36-provider-diagnostics-2026-10-12";
 const HEALTH_UPDATE_CRONS = ["49,59 18 1 10 *", "9,19,29,39 19 1 10 *"];
 const HEALTH_UPDATE_START = Date.parse("2026-10-01T18:49:00Z");
 const HEALTH_UPDATE_END = Date.parse("2026-10-01T19:39:00Z");
@@ -85,6 +85,14 @@ export default {
       return Response.json({ ...last, build: BUILD_ID, lastCompletedAt: last.completedAt || last.at || null,
         stale: !last.at || Date.now() - Date.parse(last.completedAt || last.at) > 6 * 60_000,
         progress: active });
+    }
+    if (url.pathname === "/provider-health") {
+      return Response.json({
+        lastDexResponse: JSON.parse(await stateGet(env, "last_dex_response") || "null"),
+        pairsBudget: JSON.parse(await stateGet(env, "dex_pairs_budget") || "{}"),
+        discoveryBudget: JSON.parse(await stateGet(env, "dex_discovery_budget") || "{}"),
+        rugcheckRetryAt: Number(await stateGet(env, "rugcheck_retry_at")) || null
+      });
     }
     if (url.pathname === "/learning") {
       const records = parseJsonArray(await stateGet(env, "learning_records"));
@@ -1742,6 +1750,12 @@ async function dexJson(env, url, options = {}) {
   }
   if (env._dex) env._dex.requests += 1;
   const response = await fetch(url, { ...options, signal: AbortSignal.timeout(15_000) });
+  await statePut(env, JSON.stringify({ at: new Date().toISOString(),
+    path: new URL(url).pathname, status: response.status, bucket,
+    retryAfter: response.headers.get("retry-after"), server: response.headers.get("server"),
+    ray: response.headers.get("cf-ray"), contentType: response.headers.get("content-type"),
+    errorBody: response.ok ? null : (await response.clone().text()).slice(0, 500)
+  }), "last_dex_response");
   if (response.status === 429) {
     const header = response.headers.get("retry-after");
     const seconds = Number(header);
