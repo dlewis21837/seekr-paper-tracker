@@ -1,6 +1,7 @@
 import { discover } from './solana-feed.mjs';
 import { State, stateGet, statePut, getBestPair, getSolanaSafety, insidePacificWindow } from './scanner-base.mjs';
 export { State };
+const TRIAL_PAUSED = true; // Temporary isolation test: original scanner has priority.
 export const SOL = 'So11111111111111111111111111111111111111112';
 
 export function gate(p, now = Date.now()) {
@@ -86,6 +87,12 @@ async function deliverTrialAlerts(env, trades, result) {
 }
 
 async function run(env) {
+  if (TRIAL_PAUSED) {
+    const result = { at: new Date().toISOString(), ok: true, paused: true,
+      skipped: 'Temporarily paused to diagnose original scanner rate limits' };
+    console.log('TRIAL_SCAN', JSON.stringify(result));
+    return result;
+  }
   console.log('TRIAL_SCAN_START', new Date().toISOString());
   const stub = env.STATE.get(env.STATE.idFromName('seekr'));
   const token = crypto.randomUUID();
@@ -205,6 +212,7 @@ export default {
     if (path === '/status') {
       return Response.json({
         ...await jsonGet(env, 'trial_status', {}),
+        paused: TRIAL_PAUSED,
         feedBudget: await jsonGet(env, 'free_feed_budget', {})
       });
     }
