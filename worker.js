@@ -432,6 +432,9 @@ async function scan(env) {
         break;
       }
       results.push({ contract: call.contract, error: String(error) });
+      // Safety has its own persisted cooldown. Keep the candidate pending,
+      // but continue cheap market reviews instead of freezing the whole queue.
+      if (String(error).includes("safety report unavailable")) continue;
       if (String(error).includes("429")) {
         await statePut(env, Date.now() + 2 * 60_000, "seekr_provider_retry_at");
         break;
