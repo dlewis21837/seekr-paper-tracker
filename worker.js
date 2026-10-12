@@ -246,7 +246,8 @@ export class State {
     }
     if (url.pathname === "/get") {
       const key = safeStateKey(url.searchParams.get("key") || "last_message_id");
-      return new Response(String((await this.storage.get(key)) || ""));
+      const value = await this.storage.get(key);
+      return new Response(value && typeof value === "object" ? JSON.stringify(value) : String(value || ""));
     }
     if (url.pathname === "/put" && request.method === "POST") {
       const key = safeStateKey(url.searchParams.get("key") || "last_message_id");
