@@ -1,6 +1,6 @@
 const CHANNEL = "SeekrTrending";
 const PAPER_TRACKING_ENABLED = false;
-const BUILD_ID = "scanner-v36-provider-diagnostics-2026-10-12";
+const BUILD_ID = "scanner-v37-token-pair-recovery-2026-10-12";
 const HEALTH_UPDATE_CRONS = ["49,59 18 1 10 *", "9,19,29,39 19 1 10 *"];
 const HEALTH_UPDATE_START = Date.parse("2026-10-01T18:49:00Z");
 const HEALTH_UPDATE_END = Date.parse("2026-10-01T19:39:00Z");
@@ -1719,8 +1719,10 @@ async function getBestPairs(contracts, chainId, env) {
   const local = new Map();
   for (let i = 0; i < missing.length; i += 30) {
     const batch = missing.slice(i, i + 30);
-    const pairs = await dexJson(env, `https://api.dexscreener.com/tokens/v1/${chainId}/${batch.join(",")}`);
+    // Use the documented per-token pool endpoint. The multi-token endpoint
+    // has repeatedly returned 429 even while discovery endpoints are healthy.
     for (const address of batch) {
+      const pairs = await dexJson(env, `https://api.dexscreener.com/token-pairs/v1/${chainId}/${address}`);
       const data = (Array.isArray(pairs) ? pairs : []).filter((pair) => pair.chainId === chainId && pair.baseToken?.address === address);
       local.set(address, data);
       env?._dex?.cache.set(chainId + ":" + address, data);
