@@ -614,7 +614,7 @@ async function scanSolanaMomentum(env) {
   try {
     const discovery = await getSolanaMomentumPayloads(env);
     const payloads = discovery.payloads;
-    await statePut(env, now + 3 * 60_000, "solana_next_attempt");
+    await statePut(env, now + 170_000, "solana_next_attempt");
     const currentAlerts = parseJsonArray(await stateGet(env, "solana_momentum_alerted"));
     const legacyPumpSwapAlerts = parseJsonArray(await stateGet(env, "pumpswap_alerted"));
     const alertHistory = [...currentAlerts, ...legacyPumpSwapAlerts]
@@ -1740,10 +1740,8 @@ async function getBestPairs(contracts, chainId, env) {
   const local = new Map();
   for (let i = 0; i < missing.length; i += 30) {
     const batch = missing.slice(i, i + 30);
-    // Use the documented per-token pool endpoint. The multi-token endpoint
-    // has repeatedly returned 429 even while discovery endpoints are healthy.
+    const pairs = await dexJson(env, `https://api.dexscreener.com/tokens/v1/${chainId}/${batch.join(",")}`);
     for (const address of batch) {
-      const pairs = await dexJson(env, `https://api.dexscreener.com/token-pairs/v1/${chainId}/${address}`);
       const data = (Array.isArray(pairs) ? pairs : []).filter((pair) => pair.chainId === chainId && pair.baseToken?.address === address);
       local.set(address, data);
       env?._dex?.cache.set(chainId + ":" + address, data);
