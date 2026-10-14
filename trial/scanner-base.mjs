@@ -172,6 +172,18 @@ export class State {
 
   async fetch(request) {
     const url = new URL(request.url);
+    if (url.pathname === "/provider-fetch" && request.method === "POST") {
+      const { url: target, headers = {} } = await request.json();
+      const targetUrl = new URL(target);
+      if (targetUrl.protocol !== "https:" || !["api.dexscreener.com", "api.geckoterminal.com", "api.rugcheck.xyz"].includes(targetUrl.hostname)) {
+        return new Response("Provider not allowed", { status: 400 });
+      }
+      const response = await fetch(targetUrl.href, { headers: {
+        Accept: "application/json", "User-Agent": "SeekrScanner/1.0 (+https://github.com/dlewis21837/seekr-paper-tracker)",
+        ...headers
+      }, signal: AbortSignal.timeout(15_000) });
+      return response;
+    }
     if (url.pathname === "/dex-permit" && request.method === "POST") {
       const { priority } = await request.json();
       const result = await this.storage.transaction(async (tx) => {
@@ -1714,6 +1726,15 @@ async function getBestPairs(contracts, chainId, env) {
   return best;
 }
 
+async function providerFetch(env, url, options = {}) {
+  if (!env?.STATE) return fetch(url, { ...options, signal: AbortSignal.timeout(15_000) });
+  const gateway = env.STATE.get(env.STATE.idFromName("provider_gateway_wnam_v1"), { locationHint: "wnam" });
+  return gateway.fetch("https://state/provider-fetch", {
+    method: "POST", body: JSON.stringify({ url, headers: options.headers || {} }),
+    signal: AbortSignal.timeout(20_000)
+  });
+}
+
 async function dexJson(env, url, options = {}) {
   if (!env?.STATE) throw new Error("DexScreener request governor requires STATE");
   const stub = env.STATE.get(env.STATE.idFromName("seekr"));
@@ -1728,7 +1749,7 @@ async function dexJson(env, url, options = {}) {
     throw new Error(permit.reason + " until " + new Date(permit.retryAt).toISOString());
   }
   if (env._dex) env._dex.requests += 1;
-  const response = await fetch(url, { ...options, signal: AbortSignal.timeout(15_000) });
+  const response = await providerFetch(env, url, options);
   if (response.status === 429) {
     const header = response.headers.get("retry-after");
     const seconds = Number(header);
@@ -1755,7 +1776,7 @@ async function getSolanaSafety(contract, env) {
     if (now < retryAt) return { passed: false, summary: "blocked: safety report unavailable (Rugcheck provider cooldown until " + new Date(retryAt).toISOString() + ")" };
   }
   try {
-    const response = await fetch(`https://api.rugcheck.xyz/v1/tokens/${contract}/report`, {
+    const response = await providerFetch(env, `https://api.rugcheck.xyz/v1/tokens/${contract}/report`, {
       headers: { "User-Agent": "SeekrSafetyGate/1.0" },
       signal: AbortSignal.timeout(15_000),
     });
