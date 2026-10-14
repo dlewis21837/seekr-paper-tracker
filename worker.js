@@ -1,6 +1,7 @@
+const SCANNER_PAUSED = true; // Switch back to false to resume the original scanner.
 const CHANNEL = "SeekrTrending";
 const PAPER_TRACKING_ENABLED = false;
-const BUILD_ID = "scanner-v38-provider-gateway-2026-10-12";
+const BUILD_ID = "scanner-v39-paused-for-low-cap-2026-10-14";
 const HEALTH_UPDATE_CRONS = ["49,59 18 1 10 *", "9,19,29,39 19 1 10 *"];
 const HEALTH_UPDATE_START = Date.parse("2026-10-01T18:49:00Z");
 const HEALTH_UPDATE_END = Date.parse("2026-10-01T19:39:00Z");
@@ -82,7 +83,7 @@ export default {
       ]);
       const last = JSON.parse(completed || "{}");
       const active = JSON.parse(progress || "{}");
-      return Response.json({ ...last, build: BUILD_ID, lastCompletedAt: last.completedAt || last.at || null,
+      return Response.json({ ...last, paused: SCANNER_PAUSED, build: BUILD_ID, lastCompletedAt: last.completedAt || last.at || null,
         stale: !last.at || Date.now() - Date.parse(last.completedAt || last.at) > 6 * 60_000,
         progress: active });
     }
@@ -288,6 +289,7 @@ async function statePut(env, value, key = "last_message_id") {
 }
 
 async function runScan(env) {
+  if (SCANNER_PAUSED) return { ok: true, paused: true, at: new Date().toISOString(), skipped: "Original scanner paused for low-cap trial" };
   env = { ...env, _scanDeadline: Date.now() + 150_000, _dex: { cache: new Map(), confirmations: new Map(), sharedConfirmations: 0, requests: 0, cacheHits: 0, throttled: 0, priority: "discovery" } };
   const at = new Date().toISOString();
   if (!env.STATE) return { ok: false, at, error: "Missing STATE binding" };
