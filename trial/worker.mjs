@@ -206,6 +206,7 @@ export default {
       const last = await jsonGet(env, "trial_status", {});
       return Response.json({ build: "low-cap-active-2026-10-14", paused: TRIAL_PAUSED,
         configured: Boolean(env.RUN_KEY && env.STATE && env.SOLANATRACKER_API_KEY && env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID),
+        missingSettings: ["RUN_KEY", "STATE", "SOLANATRACKER_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"].filter(key => !env[key]),
         lastScanAt: last.at || null, lastCompletedAt: last.completedAt || null,
         ok: last.ok ?? null, skipped: last.skipped || null, errorCount: last.errors?.length || 0,
         discovered: last.discovered ?? null, alertsSent: last.alertsSent?.length || 0 });
