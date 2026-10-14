@@ -1,7 +1,7 @@
 import { discover } from './solana-feed.mjs';
 import { State, stateGet, statePut, getBestPair, getSolanaSafety, insidePacificWindow } from './scanner-base.mjs';
 export { State };
-const TRIAL_PAUSED = true; // Temporary isolation test: original scanner has priority.
+const TRIAL_PAUSED = false; // Original scanner paused for this comparison.
 export const SOL = 'So11111111111111111111111111111111111111112';
 
 export function gate(p, now = Date.now()) {
@@ -202,6 +202,14 @@ async function run(env) {
 
 export default {
   async fetch(req, env) {
+    if (new URL(req.url).pathname === "/health") {
+      const last = await jsonGet(env, "trial_status", {});
+      return Response.json({ build: "low-cap-active-2026-10-14", paused: TRIAL_PAUSED,
+        configured: Boolean(env.RUN_KEY && env.STATE && env.SOLANATRACKER_API_KEY && env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID),
+        lastScanAt: last.at || null, lastCompletedAt: last.completedAt || null,
+        ok: last.ok ?? null, skipped: last.skipped || null, errorCount: last.errors?.length || 0,
+        discovered: last.discovered ?? null, alertsSent: last.alertsSent?.length || 0 });
+    }
     if (!env.RUN_KEY || req.headers.get('Authorization') !== `Bearer ${env.RUN_KEY}`) {
       return new Response('Unauthorized', { status: 401 });
     }
