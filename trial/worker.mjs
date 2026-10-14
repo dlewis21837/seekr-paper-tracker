@@ -209,6 +209,7 @@ export default {
         missingSettings: ["RUN_KEY", "STATE", "SOLANATRACKER_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"].filter(key => !env[key]),
         lastScanAt: last.at || null, lastCompletedAt: last.completedAt || null,
         ok: last.ok ?? null, skipped: last.skipped || null, errorCount: last.errors?.length || 0,
+        errorSummary: [...new Set((last.errors || []).map(item => String(item.error || "").replace(/https?:\/\/\S+/g, "[provider URL]").slice(0, 250)))].slice(0, 4),
         discovered: last.discovered ?? null, alertsSent: last.alertsSent?.length || 0 });
     }
     if (!env.RUN_KEY || req.headers.get('Authorization') !== `Bearer ${env.RUN_KEY}`) {
