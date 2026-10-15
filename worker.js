@@ -1,7 +1,7 @@
-const SCANNER_PAUSED = true; // Switch back to false to resume the original scanner.
+const SCANNER_PAUSED = false; // Original scanner resumed by user.
 const CHANNEL = "SeekrTrending";
 const PAPER_TRACKING_ENABLED = false;
-const BUILD_ID = "scanner-v39-paused-for-low-cap-2026-10-14";
+const BUILD_ID = "scanner-v39-resumed-original-2026-10-15";
 const HEALTH_UPDATE_CRONS = ["49,59 18 1 10 *", "9,19,29,39 19 1 10 *"];
 const HEALTH_UPDATE_START = Date.parse("2026-10-01T18:49:00Z");
 const HEALTH_UPDATE_END = Date.parse("2026-10-01T19:39:00Z");
