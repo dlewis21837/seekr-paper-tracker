@@ -1,7 +1,7 @@
 import { discover } from './solana-feed.mjs';
 import { State, stateGet, statePut, getBestPair, getSolanaSafety, insidePacificWindow } from './scanner-base.mjs';
 export { State };
-const TRIAL_PAUSED = false; // Original scanner paused for this comparison.
+const TRIAL_PAUSED = true; // Paused by user to resume original scanner.
 export const SOL = 'So11111111111111111111111111111111111111112';
 
 export function marketRejections(p, now = Date.now()) {
@@ -152,7 +152,7 @@ export async function sendOneTimePreview(env) {
 async function run(env) {
   if (TRIAL_PAUSED) {
     const result = { at: new Date().toISOString(), ok: true, paused: true,
-      skipped: 'Temporarily paused to diagnose original scanner rate limits' };
+      skipped: 'Low-cap trial paused by user; original scanner selected' };
     console.log('TRIAL_SCAN', JSON.stringify(result));
     return result;
   }
