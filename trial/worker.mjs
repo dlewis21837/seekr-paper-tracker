@@ -4,14 +4,42 @@ export { State };
 const TRIAL_PAUSED = false; // Original scanner paused for this comparison.
 export const SOL = 'So11111111111111111111111111111111111111112';
 
-export function gate(p, now = Date.now()) {
-  const cap = Number(p?.marketCap), liq = Number(p?.liquidity?.usd);
-  const buys = Number(p?.txns?.m5?.buys), sells = Number(p?.txns?.m5?.sells);
-  const change = Number(p?.priceChange?.m5), age = now - Number(p?.pairCreatedAt);
-  return p?.chainId === 'solana' && p?.dexId === 'pumpswap' && p?.quoteToken?.address === SOL &&
-    Number(p.priceUsd) > 0 && cap >= 20000 && cap <= 75000 && liq >= 15000 && liq / cap >= .1 &&
-    Number(p?.volume?.m5) >= 3000 && buys >= 20 && sells >= 0 && buys / Math.max(1, sells) >= 1.3 &&
-    change >= 3 && change <= 35 && age >= 10 * 60000;
+export function marketRejections(p, now = Date.now()) {
+  if (!p) return ['missing_pair'];
+  const cap = Number(p.marketCap), liq = Number(p.liquidity?.usd);
+  const buys = Number(p.txns?.m5?.buys), sells = Number(p.txns?.m5?.sells);
+  const change = Number(p.priceChange?.m5), age = now - Number(p.pairCreatedAt);
+  const checks = [
+    ['chain', p.chainId === 'solana'], ['dex', p.dexId === 'pumpswap'],
+    ['quote', p.quoteToken?.address === SOL], ['price', Number(p.priceUsd) > 0],
+    ['market_cap', cap >= 20000 && cap <= 75000],
+    ['liquidity', liq >= 15000], ['liquidity_ratio', liq / cap >= .1],
+    ['volume_m5', Number(p.volume?.m5) >= 3000],
+    ['buys_m5', buys >= 20], ['buy_sell_ratio', sells >= 0 && buys / Math.max(1, sells) >= 1.3],
+    ['change_m5', change >= 3 && change <= 35], ['pool_age', age >= 10 * 60000]
+  ];
+  return checks.filter(([, passed]) => !passed).map(([reason]) => reason);
+}
+export function gate(p, now = Date.now()) { return marketRejections(p, now).length === 0; }
+
+// Recheck recent qualifying observations first so rotation preserves two-scan confirmation.
+export function selectCandidates(candidates, observations, cursor, now, limit = 4) {
+  const unique = [...new Set(candidates)];
+  const pending = unique.filter(contract => {
+    const age = now - Number(observations[contract]?.at);
+    return age >= 120000 && age <= 600000;
+  }).sort((a, b) => observations[a].at - observations[b].at).slice(0, limit);
+  const start = unique.length ? (Math.max(0, Number(cursor) || 0) % unique.length) : 0;
+  const selected = [...pending];
+  let visited = 0;
+  while (selected.length < limit && visited < unique.length) {
+    const contract = unique[(start + visited++) % unique.length];
+    if (!selected.includes(contract)) selected.push(contract);
+  }
+  return { selected, nextCursor: unique.length ? (start + visited) % unique.length : 0 };
+}
+function countReasons(counts, reasons) {
+  for (const reason of reasons) counts[reason] = (counts[reason] || 0) + 1;
 }
 
 // Simulation: sampled prices with 2% adverse fill on each side.
@@ -180,17 +208,37 @@ async function run(env) {
         contract => !trades.some(t => t.contract === contract)
       );
       result.discovered = candidates.length;
-      for (const contract of [...new Set(candidates)].slice(0, 4)) {
+      const observations = await jsonGet(env, 'trial_observations', {});
+      const cursor = await jsonGet(env, 'trial_candidate_cursor', 0);
+      const selection = selectCandidates(candidates, observations, cursor, now);
+      await statePut(env, JSON.stringify(selection.nextCursor), 'trial_candidate_cursor');
+      result.diagnostics = { checked: 0, marketPassed: 0, safetyPassed: 0,
+        marketRejected: 0, safetyRejected: 0, awaitingConfirmation: 0,
+        confirmationRejected: 0, reasons: {}, safetyReasons: {} };
+      for (const contract of selection.selected) {
         if (Date.now() + 35000 >= env._scanDeadline) break;
         try {
           const first = await getBestPair(contract, 'pumpswap', 'solana', env);
-          if (!gate(first)) continue;
+          result.diagnostics.checked++;
+          const rejectionReasons = marketRejections(first);
+          if (rejectionReasons.length) {
+            result.diagnostics.marketRejected++;
+            countReasons(result.diagnostics.reasons, rejectionReasons);
+            delete observations[contract];
+            await statePut(env, JSON.stringify(observations), 'trial_observations');
+            continue;
+          }
+          result.diagnostics.marketPassed++;
           const safety = await getSolanaSafety(contract, env);
           if (!safety.passed) {
+            result.diagnostics.safetyRejected++;
+            countReasons(result.diagnostics.safetyReasons, [safety.summary]);
+            delete observations[contract];
+            await statePut(env, JSON.stringify(observations), 'trial_observations');
             result.errors.push({ contract, error: safety.summary });
             continue;
           }
-          const observations = await jsonGet(env, 'trial_observations', {});
+          result.diagnostics.safetyPassed++;
           const prev = observations[contract];
           observations[contract] = {
             at: now, price: Number(first.priceUsd),
@@ -203,7 +251,12 @@ async function run(env) {
           if (!prev || now - prev.at < 120000 || now - prev.at > 10 * 60000 ||
               prev.pair !== first.pairAddress ||
               Number(first.priceUsd) < prev.price * .95 ||
-              Number(first.liquidity.usd) < prev.liquidity * .9) continue;
+              Number(first.liquidity.usd) < prev.liquidity * .9) {
+            if (!prev || now - prev.at > 10 * 60000 || now - prev.at < 120000)
+              result.diagnostics.awaitingConfirmation++;
+            else result.diagnostics.confirmationRejected++;
+            continue;
+          }
           trades.push({
             contract, name: first.baseToken.name, pairAddress: first.pairAddress,
             entryAt: now, entryCap: first.marketCap,
@@ -241,13 +294,14 @@ export default {
     if (new URL(req.url).pathname === "/health") {
       const last = await jsonGet(env, "trial_status", {});
       const preview = await jsonGet(env, PREVIEW_KEY, null);
-      return Response.json({ build: "low-cap-telegram-preview-2026-10-15", testAlert: preview, paused: TRIAL_PAUSED,
+      return Response.json({ build: "low-cap-diagnostics-rotation-2026-10-15", testAlert: preview, paused: TRIAL_PAUSED,
         configured: Boolean(env.STATE && env.SOLANATRACKER_API_KEY && env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID),
         manualAccessConfigured: Boolean(env.RUN_KEY),
         missingSettings: ["RUN_KEY", "STATE", "SOLANATRACKER_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"].filter(key => !env[key]),
         lastScanAt: last.at || null, lastCompletedAt: last.completedAt || null,
         ok: last.ok ?? null, skipped: last.skipped || null, errorCount: last.errors?.length || 0,
         errorSummary: [...new Set((last.errors || []).map(item => String(item.error || "").replace(/https?:\/\/\S+/g, "[provider URL]").slice(0, 250)))].slice(0, 4),
+        diagnostics: last.diagnostics || null,
         discovered: last.discovered ?? null, alertsSent: last.alertsSent?.length || 0 });
     }
     if (!env.RUN_KEY || req.headers.get('Authorization') !== `Bearer ${env.RUN_KEY}`) {
