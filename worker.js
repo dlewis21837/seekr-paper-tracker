@@ -1,7 +1,7 @@
 const SCANNER_PAUSED = false; // Original scanner resumed by user.
 const CHANNEL = "SeekrTrending";
 const PAPER_TRACKING_ENABLED = false;
-const BUILD_ID = "scanner-v39-resumed-original-2026-10-15";
+const BUILD_ID = "scanner-v40-discovery-recovery-2026-10-15";
 const HEALTH_UPDATE_CRONS = ["49,59 18 1 10 *", "9,19,29,39 19 1 10 *"];
 const HEALTH_UPDATE_START = Date.parse("2026-10-01T18:49:00Z");
 const HEALTH_UPDATE_END = Date.parse("2026-10-01T19:39:00Z");
@@ -300,7 +300,7 @@ async function runScan(env) {
   try {
     await scanProgress(env, "starting", at);
     const result = await scan(env);
-    const status = { at, completedAt: new Date().toISOString(), ok: result.ok, seekrChecked: result.seekrChecked ?? 0,
+    const status = { at, completedAt: new Date().toISOString(), ok: result.ok, degraded: result.degraded || false, seekrChecked: result.seekrChecked ?? 0,
       seekrErrors: (result.seekrResults || []).filter((item) => item.error).length,
       seekrDeferred: result.seekrDeferred ?? 0,
       seekrPending: result.seekrPending ?? 0, seekrRetryAt: result.seekrRetryAt || null,
@@ -475,7 +475,10 @@ async function scan(env) {
   if (connected) {
     await sendTelegram(env, `✅ Seekr + PumpSwap Solana tracker connected. Build: <code>${BUILD_ID}</code>. Scanning every 3 minutes from 5:00 a.m. to 8:00 p.m. Pacific.`);
   }
-  return { ok: true, build: BUILD_ID, seekrChecked: results.length, seekrDeferred: seekrDexDeferred ? seekrBatch.length : 0,
+  const degraded = Boolean(solanaMomentum.pumpSwap?.error || solanaMomentum.pumpSwap?.discoveryError ||
+    solanaMomentum.pumpSwap?.skipped || solanaMomentum.pumpSwap?.results?.some((item) => item.error) ||
+    results.some((item) => item.error) || seekrDexDeferred);
+  return { ok: !degraded, degraded, build: BUILD_ID, seekrChecked: results.length, seekrDeferred: seekrDexDeferred ? seekrBatch.length : 0,
     seekrPending: pending.length,
     seekrRetryAt: Date.now() < (Number(await stateGet(env, "seekr_provider_retry_at")) || 0)
       ? new Date(Number(await stateGet(env, "seekr_provider_retry_at"))).toISOString() : null,
@@ -526,7 +529,29 @@ async function fetchJsonWithRetry(url, options = {}, attempts = 3) {
   throw lastError || new Error("Request failed");
 }
 
+// Cached discovery nominates candidates only. Every alert still needs fresh
+// pair data, two market observations and the existing independent safety check.
 async function getSolanaMomentumPayloads(env) {
+  const cached = JSON.parse(await stateGet(env, "solana_discovery_cache") || "null");
+  const age = cached ? Date.now() - num(cached.at) : Infinity;
+  if (age >= 0 && age < 180_000) {
+    return { ...cached.discovery, cached: true, cacheAgeMs: age };
+  }
+  try {
+    const discovery = await fetchSolanaMomentumPayloads(env);
+    if (discovery.payloads.some((payload) => payload?.data?.length)) {
+      await statePut(env, JSON.stringify({ at: Date.now(), discovery }), "solana_discovery_cache");
+    }
+    return discovery;
+  } catch (error) {
+    if (age >= 0 && age <= 15 * 60_000 && cached?.discovery?.payloads?.length) {
+      return { ...cached.discovery, cached: true, cacheAgeMs: age, providerError: String(error) };
+    }
+    throw error;
+  }
+}
+
+async function fetchSolanaMomentumPayloads(env) {
   const requestJson = (url, options = {}, attempts = 1) =>
     new URL(url).hostname === "api.dexscreener.com"
       ? dexJson(env, url, options)
@@ -630,6 +655,10 @@ async function scanSolanaMomentum(env) {
       fallbackName: "PumpSwap token",
     }, alertHistory, now);
     const meteora = disabledMomentumSource();
+    pumpSwap.discoverySource = discovery.source;
+    pumpSwap.discoveryCached = Boolean(discovery.cached);
+    pumpSwap.discoveryCacheAgeMs = discovery.cacheAgeMs || 0;
+    pumpSwap.discoveryError = discovery.providerError || null;
     await statePut(env, JSON.stringify(alertHistory.slice(-300)), "solana_momentum_alerted");
     return { raydium, pumpSwap, meteora };
   } catch (error) {
@@ -690,11 +719,13 @@ async function processSolanaMomentumDex(env, payloads, config, alertHistory, now
     }
 
     const lastAlert = new Map(alertHistory.map((item) => [String(item.contract), num(item.alertedAt)]));
-    const candidates = [...tokens.values()]
+    const eligible = [...tokens.values()]
       .filter((item) => !lastAlert.has(item.contract))
-      .sort((a, b) => b.volumeH1 - a.volumeH1)
-      // Keep total Rugcheck usage below the provider limit while Seekr drains.
-      .slice(0, 2);
+      .sort((a, b) => b.volumeH1 - a.volumeH1 || a.contract.localeCompare(b.contract));
+    const cursorKey = "momentum_cursor_" + config.dexId;
+    const cursor = eligible.length ? (Number(await stateGet(env, cursorKey)) || 0) % eligible.length : 0;
+    // Rotate the bounded batch so a rejected leader cannot starve every other token.
+    const candidates = [...eligible.slice(cursor), ...eligible.slice(0, cursor)].slice(0, 2);
     const results = [];
     for (const call of candidates) {
       if (!scanHasTime(env, 45_000)) break;
@@ -721,7 +752,9 @@ async function processSolanaMomentumDex(env, payloads, config, alertHistory, now
         results.push({ contract: call.contract, error: String(error) });
       }
     }
-    return { discovered: tokens.size, checked: results.length, deferred: candidates.length - results.length, results };
+    await statePut(env, eligible.length ? (cursor + results.length) % eligible.length : 0, cursorKey);
+    return { discovered: tokens.size, checked: results.length,
+      deferred: Math.max(0, eligible.length - results.length), results };
   } catch (error) {
     return { discovered: 0, checked: 0, error: String(error) };
   }
