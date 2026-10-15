@@ -86,6 +86,41 @@ async function deliverTrialAlerts(env, trades, result) {
   }
 }
 
+
+const PREVIEW_KEY = 'trial_alert_preview_2026_10_15';
+export async function sendOneTimePreview(env) {
+  if (!insidePacificWindow() || Date.now() >= Date.parse('2026-10-16T03:00:00Z')) return;
+  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) return;
+  if (await jsonGet(env, PREVIEW_KEY, null)) return;
+  // Called under the scanner lease. Claim before sending to avoid duplicate previews.
+  const preview = { state: 'attempted', attemptedAt: new Date().toISOString() };
+  await statePut(env, JSON.stringify(preview), PREVIEW_KEY);
+  try {
+    const text = [
+      '🧪 <b>PUMPSWAP LOW-CAP — TEST ALERT</b>',
+      '<b>DISPLAY TEST ONLY — not a coin recommendation</b>',
+      'Market cap: $45,000 (example)',
+      'Safety: example field — no token evaluated',
+      'CA: omitted for this display test',
+      'Real candidate alerts include the exact contract linked to DexScreener.',
+      'Telegram delivery test only; no purchase or simulated trade was made.'
+    ].join('\n');
+    const response = await fetch('https://api.telegram.org/bot' + env.TELEGRAM_BOT_TOKEN + '/sendMessage', {
+      method: 'POST', signal: AbortSignal.timeout(15000),
+      headers: {'content-type': 'application/json'},
+      body: JSON.stringify({chat_id: env.TELEGRAM_CHAT_ID, text,
+        parse_mode: 'HTML', disable_web_page_preview: true})
+    });
+    const receipt = await response.json();
+    if (!response.ok || !receipt.ok) throw new Error('Telegram rejected test message');
+    preview.state = 'sent';
+    preview.sentAt = new Date().toISOString();
+  } catch {
+    preview.state = 'failed';
+  }
+  await statePut(env, JSON.stringify(preview), PREVIEW_KEY);
+}
+
 async function run(env) {
   if (TRIAL_PAUSED) {
     const result = { at: new Date().toISOString(), ok: true, paused: true,
@@ -116,6 +151,7 @@ async function run(env) {
     at: new Date(now).toISOString(), mode: 'SIMULATION', opened: [], alertsSent: [], errors: []
   };
   try {
+    try { await sendOneTimePreview(env); } catch { console.log('TRIAL_PREVIEW_STATE_ERROR'); }
     const trades = await jsonGet(env, 'trial_trades', []);
     for (const t of trades.filter(t => !t.closedAt)) {
       try {
@@ -204,7 +240,8 @@ export default {
   async fetch(req, env) {
     if (new URL(req.url).pathname === "/health") {
       const last = await jsonGet(env, "trial_status", {});
-      return Response.json({ build: "low-cap-provider-gateway-2026-10-14", paused: TRIAL_PAUSED,
+      const preview = await jsonGet(env, PREVIEW_KEY, null);
+      return Response.json({ build: "low-cap-telegram-preview-2026-10-15", testAlert: preview, paused: TRIAL_PAUSED,
         configured: Boolean(env.STATE && env.SOLANATRACKER_API_KEY && env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID),
         manualAccessConfigured: Boolean(env.RUN_KEY),
         missingSettings: ["RUN_KEY", "STATE", "SOLANATRACKER_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"].filter(key => !env[key]),
