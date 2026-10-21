@@ -1,0 +1,13 @@
+{
+  "name": "solana-swarm-experiment",
+  "main": "pumpportal-experiment.mjs",
+  "compatibility_date": "2026-10-20",
+  "triggers": {"crons": ["* * * * *"]},
+  "vars": {
+    "EXPERIMENT_ENABLED": "true",
+    "EXPERIMENT_TELEGRAM_ENABLED": "false",
+    "DAILY_TRADE_EVENT_LIMIT": "0"
+  },
+  "durable_objects": {"bindings": [{"name":"FEED","class_name":"PumpPortalFeed"}]},
+  "migrations": [{"tag":"v1","new_sqlite_classes":["PumpPortalFeed"]}]
+}
