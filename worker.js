@@ -1,7 +1,7 @@
 const SCANNER_PAUSED = false; // Original scanner resumed by user.
 const CHANNEL = "SeekrTrending";
 const PAPER_TRACKING_ENABLED = false;
-const BUILD_ID = "scanner-v41-strict-quality-2026-10-20";
+const BUILD_ID = "scanner-v42-market-fallback-2026-10-21";
 const HEALTH_UPDATE_CRONS = ["49,59 18 1 10 *", "9,19,29,39 19 1 10 *"];
 const HEALTH_UPDATE_START = Date.parse("2026-10-01T18:49:00Z");
 const HEALTH_UPDATE_END = Date.parse("2026-10-01T19:39:00Z");
@@ -193,6 +193,16 @@ export class State {
       }, signal: AbortSignal.timeout(15_000) });
       return response;
     }
+    if (url.pathname === "/gecko-permit" && request.method === "POST") {
+      const result = await this.storage.transaction(async (tx) => {
+        const now = Date.now();
+        const nextAt = Number(await tx.get("gecko_next_request_at")) || 0;
+        if (nextAt > now) return { waitMs: nextAt - now };
+        await tx.put("gecko_next_request_at", now + 2500);
+        return { allowed: true };
+      });
+      return Response.json(result);
+    }
     if (url.pathname === "/dex-permit" && request.method === "POST") {
       const { priority, bucket } = await request.json();
       const budgetKey = bucket === "discovery" ? "dex_discovery_budget" : "dex_pairs_budget";
@@ -309,7 +319,7 @@ async function runScan(env) {
       sources: { raydium: result.raydium, pumpSwap: result.pumpSwap, meteora: result.meteora,
         robinhood: result.robinhood, bnb: result.bnb }, paperError: result.paper?.error || null, paperEnabled: PAPER_TRACKING_ENABLED,
       error: result.error || null, skipped: result.skipped || null,
-      dex: { requests: env._dex.requests, cacheHits: env._dex.cacheHits, sharedConfirmations: env._dex.sharedConfirmations, throttled: env._dex.throttled,
+      dex: { requests: env._dex.requests, cacheHits: env._dex.cacheHits, sharedConfirmations: env._dex.sharedConfirmations, marketFallbackRequests: env._dex.marketFallbackRequests || 0, throttled: env._dex.throttled,
         retryAt: env._dex.retryAt || null }, paperSkipped: result.paper?.skipped || null };
     await statePut(env, JSON.stringify(status), "last_scan_status").catch(console.error);
     await scanProgress(env, "completed", at);
@@ -554,8 +564,8 @@ async function getSolanaMomentumPayloads(env) {
 async function fetchSolanaMomentumPayloads(env) {
   const requestJson = (url, options = {}, attempts = 1) =>
     new URL(url).hostname === "api.dexscreener.com"
-      ? dexJson(env, url, options)
-      : providerFetch(env, url, options).then(check).then((r) => r.json());
+      ? marketPairsJson(env, url, options)
+      : geckoJson(env, url, options);
   try {
     const geckoRetryAt = Number(await stateGet(env, "gecko_provider_retry_at")) || 0;
     if (Date.now() < geckoRetryAt) throw new Error("GeckoTerminal provider cooldown until " + new Date(geckoRetryAt).toISOString());
@@ -1732,7 +1742,7 @@ async function getBestPair(contract, dexId = null, chainId = "solana", env, forc
   let data = !forceFresh && env?._dex?.cache.get(key);
   if (data) env._dex.cacheHits += 1;
   else {
-    data = await dexJson(env, `https://api.dexscreener.com/token-pairs/v1/${chainId}/${contract}`);
+    data = await marketPairsJson(env, `https://api.dexscreener.com/token-pairs/v1/${chainId}/${contract}`);
     env?._dex?.cache.set(key, data);
   }
   return selectBestPair(data, contract, dexId, chainId);
@@ -1775,7 +1785,7 @@ async function getBestPairs(contracts, chainId, env) {
   const local = new Map();
   for (let i = 0; i < missing.length; i += 30) {
     const batch = missing.slice(i, i + 30);
-    const pairs = await dexJson(env, `https://api.dexscreener.com/tokens/v1/${chainId}/${batch.join(",")}`);
+    const pairs = await marketPairsJson(env, `https://api.dexscreener.com/tokens/v1/${chainId}/${batch.join(",")}`);
     for (const address of batch) {
       const data = (Array.isArray(pairs) ? pairs : []).filter((pair) => pair.chainId === chainId && pair.baseToken?.address === address);
       local.set(address, data);
@@ -1789,6 +1799,71 @@ async function getBestPairs(contracts, chainId, env) {
     if (pair) best.set(address.toLowerCase(), pair);
   }
   return best;
+}
+
+
+async function geckoJson(env, url, options = {}) {
+  const retryAt = Number(await stateGet(env, "gecko_provider_retry_at")) || 0;
+  if (Date.now() < retryAt) throw new Error("GeckoTerminal provider cooldown until " + new Date(retryAt).toISOString());
+  const stub = env.STATE.get(env.STATE.idFromName("seekr"));
+  for (;;) {
+    if (!scanHasTime(env, 16000)) throw new Error("Scan time budget exhausted; queued work retained");
+    const permit = await stub.fetch("https://state/gecko-permit", { method: "POST" }).then(check).then(r => r.json());
+    if (permit.allowed) break;
+    await new Promise(resolve => setTimeout(resolve, Math.min(permit.waitMs, 2500)));
+  }
+  const response = await providerFetch(env, url, options);
+  if (response.status === 429) {
+    const seconds = Number(response.headers.get("retry-after"));
+    await statePut(env, Date.now() + Math.max(180000, Number.isFinite(seconds) ? seconds * 1000 : 0), "gecko_provider_retry_at");
+  }
+  return check(response).then(r => r.json());
+}
+
+function geckoMarketPairs(payload, contract) {
+  if (!Array.isArray(payload?.data)) throw new Error("GeckoTerminal pool response unavailable");
+  const included = new Map((payload.included || []).map(item => [item.id, item.attributes || {}]));
+  const token = rel => {
+    const id = rel?.data?.id || "";
+    return { ...(included.get(id) || {}), address: String(id).replace(/^solana_/, "") };
+  };
+  return payload.data.map(pool => {
+    const a = pool.attributes || {};
+    const baseToken = token(pool.relationships?.base_token);
+    const quoteToken = token(pool.relationships?.quote_token);
+    const dexId = String(pool.relationships?.dex?.data?.id || "").toLowerCase();
+    if (baseToken.address !== contract || !TRUSTED_SOLANA_QUOTES.has(quoteToken.address) ||
+        !a.address || !dexId || !(num(a.base_token_price_usd) > 0) ||
+        !a.transactions?.h1 || !a.volume_usd || !a.price_change_percentage) return null;
+    return {
+      chainId: "solana", dexId, pairAddress: a.address,
+      url: "https://dexscreener.com/solana/" + a.address,
+      baseToken, quoteToken, priceUsd: a.base_token_price_usd,
+      marketCap: num(a.market_cap_usd), fdv: num(a.fdv_usd),
+      liquidity: { usd: num(a.reserve_in_usd) },
+      volume: a.volume_usd, txns: a.transactions, priceChange: a.price_change_percentage,
+      pairCreatedAt: Date.parse(a.pool_created_at) || null,
+      marketDataSource: "geckoterminal"
+    };
+  }).filter(Boolean);
+}
+
+async function marketPairsJson(env, url, options = {}) {
+  try {
+    return await dexJson(env, url, options);
+  } catch (error) {
+    const path = new URL(url).pathname;
+    const match = path.match(/^\/(?:token-pairs|tokens)\/v1\/solana\/([1-9A-HJ-NP-Za-km-z,]+)$/);
+    if (!match || !isDexDeferral(error)) throw error;
+    const pairs = [];
+    for (const contract of [...new Set(match[1].split(","))]) {
+      const payload = await geckoJson(env,
+        "https://api.geckoterminal.com/api/v2/networks/solana/tokens/" + contract + "/pools?include=base_token,quote_token,dex&page=1");
+      pairs.push(...geckoMarketPairs(payload, contract));
+    }
+    if (env._dex) env._dex.marketFallbackRequests = num(env._dex.marketFallbackRequests) + 1;
+    return pairs;
+  }
 }
 
 async function dexJson(env, url, options = {}) {
@@ -1998,7 +2073,11 @@ async function performMarketConfirmation(call, initialPair, options = {}) {
   }
 
   // A candidate must remain healthy across two observations before Telegram receives it.
-  await new Promise((resolve) => setTimeout(resolve, FINAL_CONFIRM_DELAY_MS));
+  // GeckoTerminal can cache a pool response for a minute. Wait beyond that
+  // interval rather than counting the same provider snapshot as confirmation.
+  const delay = initialPair?.marketDataSource === "geckoterminal" ? 65000 : FINAL_CONFIRM_DELAY_MS;
+  if (!scanHasTime(options.env, delay + 20000)) throw new Error("Scan time budget exhausted; queued work retained");
+  await new Promise((resolve) => setTimeout(resolve, delay));
   const freshPair = await getBestPair(call.contract, options.dexId || null, chainId, options.env, true);
   const freshReview = scorePair(call, freshPair, chainName);
   if (!passesMarketSafety(freshReview)) {
@@ -2068,6 +2147,7 @@ function formatAlert(call, pair, r) {
     `Market cap: <b>${usd(r.marketCap)}</b>`,
     `Entry tier: <b>${marketCapTier(r.marketCap)}</b>`,
     `Liquidity: ${usd(r.liquidity)}`,
+    `Market data: ${pair?.marketDataSource === "geckoterminal" ? "GeckoTerminal fallback" : "DexScreener"}`,
     `1h volume: ${usd(r.volumeH1)}`,
     `1h change: ${r.changeH1.toFixed(1)}%`,
     `1h buys/sells: ${r.buys}/${r.sells}`,
@@ -2075,7 +2155,7 @@ function formatAlert(call, pair, r) {
   ];
   if (first) {
     lines.push(
-      `20s recheck: market cap ${usd(num(first.marketCap))} → ${usd(r.marketCap)}; liquidity ${usd(num(first.liquidity))} → ${usd(r.liquidity)}`,
+      `Market recheck: market cap ${usd(num(first.marketCap))} → ${usd(r.marketCap)}; liquidity ${usd(num(first.liquidity))} → ${usd(r.liquidity)}`,
       `Recheck result: ${esc(r.confirmation.summary)}`,
     );
   }
