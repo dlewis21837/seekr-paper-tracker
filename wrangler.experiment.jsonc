@@ -5,7 +5,7 @@
   "triggers": {"crons": ["* * * * *"]},
   "vars": {
     "EXPERIMENT_ENABLED": "true",
-    "EXPERIMENT_TELEGRAM_ENABLED": "false",
+    "EXPERIMENT_TELEGRAM_ENABLED": "true",
     "DAILY_TRADE_EVENT_LIMIT": "0"
   },
   "durable_objects": {"bindings": [{"name":"FEED","class_name":"PumpPortalFeed"}]},
