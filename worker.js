@@ -1,26 +1,22 @@
+import { detectSwarm } from "./swarm.mjs";
 const SCANNER_PAUSED = false; // Original scanner resumed by user.
 const CHANNEL = "SeekrTrending";
 const PAPER_TRACKING_ENABLED = false;
-const BUILD_ID = "scanner-v41-strict-quality-2026-10-20";
+const BUILD_ID = "scanner-v42-trade-swarm-2026-10-20";
 const HEALTH_UPDATE_CRONS = ["49,59 18 1 10 *", "9,19,29,39 19 1 10 *"];
 const HEALTH_UPDATE_START = Date.parse("2026-10-01T18:49:00Z");
 const HEALTH_UPDATE_END = Date.parse("2026-10-01T19:39:00Z");
-const MAX_MARKET_CAP = 3_000_000;
-const MAX_PUMPSWAP_MARKET_CAP = 2_000_000;
 const MIN_LIQUIDITY = 10_000;
-const MIN_SCORE = 9; // Strict quality threshold; safety and confirmation remain mandatory.
-const FINAL_CONFIRM_DELAY_MS = 20_000;
+const FINAL_CONFIRM_DELAY_MS = 5_000;
 const MAX_5M_DROP_PCT = -15;
 const MAX_1H_DROP_PCT = -30;
-const MIN_BUY_SELL_RATIO = 0.8;
+const MIN_BUY_SELL_RATIO = 0; // Dollar pressure is evaluated from trades.
 const MIN_LIQUIDITY_TO_MARKET_CAP = 0.05;
 const MAX_ACTIVE_POOL_PRICE_SPREAD = 1.5;
 const MIN_POOL_INTEGRITY_LIQUIDITY = 1_000;
 const MIN_POOL_INTEGRITY_TRADES_H1 = 10;
-const MAX_CONFIRM_PRICE_DROP_PCT = 12;
-const MAX_CONFIRM_LIQUIDITY_DROP_PCT = 20;
-const ROBINHOOD_MIN_SCORE = 4;
-const BNB_MIN_SCORE = 4;
+const MAX_CONFIRM_PRICE_DROP_PCT = 5;
+const MAX_CONFIRM_LIQUIDITY_DROP_PCT = 10;
 const MAX_SINGLE_HOLDER_PCT = 15;
 const MAX_TOP_10_HOLDERS_PCT = 45;
 const MAX_INSIDER_HOLDINGS_PCT = 20;
@@ -32,12 +28,6 @@ const MIN_MATERIAL_UNLOCKED_POOL_USD = 2_000;
 const MIN_MATERIAL_UNLOCKED_POOL_RATIO = 0.02;
 const MAX_CREATOR_HOLDINGS_PCT = 5;
 const MAX_SUSPICIOUS_HOLDERS = 0;
-const PUMPSWAP_MIN_H1_VOLUME = 5_000;
-const PUMPSWAP_MIN_H1_BUYS = 20;
-const PUMPSWAP_MIN_H1_BUYERS = 15;
-const PUMPSWAP_MIN_BUY_SELL_RATIO = 1.1;
-const PUMPSWAP_MIN_MOMENTUM_PCT = 8;
-const PUMPSWAP_ALERT_COOLDOWN_MS = 12 * 60 * 60 * 1000;
 const LEARNING_UPDATE_INTERVAL_MS = 15 * 60 * 1000;
 const LEARNING_WINDOW_MS = 24 * 60 * 60 * 1000;
 const LEARNING_RECORD_LIMIT = 100;
@@ -66,7 +56,7 @@ const STABLE_MINTS = new Set([
   "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC
   "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", // USDT
 ]);
-const TRUSTED_SOLANA_QUOTES = new Set([SOL_MINT, ...STABLE_MINTS]);
+const TRUSTED_SOLANA_QUOTES = new Set([SOL_MINT]);
 
 export default {
   async fetch(request, env, ctx) {
@@ -107,7 +97,7 @@ export default {
     return Response.json({
       status: "Seekr + PumpSwap Solana tracker online",
       build: BUILD_ID,
-      schedule: "Every 3 minutes, 5:00 a.m.–8:00 p.m. Pacific",
+      schedule: "Every minute, 5:00 a.m.–8:00 p.m. Pacific",
       paperTrackingEnabled: PAPER_TRACKING_ENABLED,
       configured: Boolean(env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID && env.STATE),
       robinhoodConfigured: false,
@@ -309,6 +299,7 @@ async function runScan(env) {
       sources: { raydium: result.raydium, pumpSwap: result.pumpSwap, meteora: result.meteora,
         robinhood: result.robinhood, bnb: result.bnb }, paperError: result.paper?.error || null, paperEnabled: PAPER_TRACKING_ENABLED,
       error: result.error || null, skipped: result.skipped || null,
+      swarm: env._swarm || null,
       dex: { requests: env._dex.requests, cacheHits: env._dex.cacheHits, sharedConfirmations: env._dex.sharedConfirmations, throttled: env._dex.throttled,
         retryAt: env._dex.retryAt || null }, paperSkipped: result.paper?.skipped || null };
     await statePut(env, JSON.stringify(status), "last_scan_status").catch(console.error);
@@ -340,7 +331,7 @@ async function scan(env) {
     return { ok: false, error: "Missing Telegram secrets or STATE binding" };
   }
   if (!insidePacificWindow()) {
-    const learning = await updateLearningOutcomes(env).catch((error) => ({ error: String(error) }));
+    const learning = { skipped: "Outcome polling disabled to reserve provider budget for momentum" };
     const paper = PAPER_TRACKING_ENABLED ? await updatePaperLedgerSafe(env) : { disabled: true };
     if (PAPER_TRACKING_ENABLED) await maybeSendDailyPaperReport(env, paper).catch(console.error);
     return { ok: true, skipped: "Outside active hours", learning, paper };
@@ -383,7 +374,7 @@ async function scan(env) {
   if (newestId > lastId) await statePut(env, newestId);
   const results = [];
   const seekrRetryAt = Number(await stateGet(env, "seekr_provider_retry_at")) || 0;
-  const seekrBatch = Date.now() < seekrRetryAt ? [] : pending.slice(0, 15);
+  const seekrBatch = Date.now() < seekrRetryAt ? [] : pending.slice(0, 4);
   let seekrDexDeferred = false;
   if (seekrBatch.length) {
     try {
@@ -398,53 +389,36 @@ async function scan(env) {
     }
   }
   await scanProgress(env, "seekr-reviews");
-  let seekrSafetyChecks = 0;
   for (const call of seekrDexDeferred ? [] : seekrBatch) {
     if (!scanHasTime(env, 55_000)) break;
     try {
-      const pair = await getBestPair(call.contract, null, "solana", env);
-      // After the one expensive safety slot is used, cheaply drain obvious
-      // market failures and rotate plausible candidates to the next scan.
-      if (seekrSafetyChecks >= 1) {
-        const initialReview = scorePair(call, pair, "Solana");
-        if (passesMarketSafety(initialReview)) {
-          results.push({ contract: call.contract, deferred: true,
-            marketGate: "initial market gate passed; waiting for next safety slot" });
-          const deferredIndex = pending.findIndex((item) => item.id === call.id);
-          if (deferredIndex >= 0) pending.push(...pending.splice(deferredIndex, 1));
-          await statePut(env, JSON.stringify(pending), "seekr_pending_calls");
-          continue;
-        }
-        const confirmation = { passed: false, pair, review: initialReview,
-          initialReview, summary: "blocked by initial momentum gate" };
-        const safety = { passed: false, scorePenalty: 0, summary: "skipped: market gate failed" };
-        results.push({ contract: call.contract, alerted: false, score: initialReview.score,
-          rawScore: initialReview.score, safety: safety.summary, marketGate: confirmation.summary });
-        await recordLearningObservation(env, call, initialReview, safety, confirmation, false).catch(() => {});
-        const failedIndex = pending.findIndex((item) => item.id === call.id);
-        if (failedIndex >= 0) pending.splice(failedIndex, 1);
-        await statePut(env, JSON.stringify(pending), "seekr_pending_calls");
+      if (await stateGet(env, "swarm_sent_" + call.contract)) {
+        const i = pending.findIndex(x => x.id === call.id);
+        if (i >= 0) pending.splice(i,1);
         continue;
       }
-      if (passesMarketSafety(scorePair(call, pair, "Solana"))) seekrSafetyChecks += 1;
+      const pair = await getBestPair(call.contract, null, "solana", env);
       const confirmation = await confirmMarketMomentum(call, pair, { env });
       const review = confirmation.review;
       // A failed market gate cannot alert; avoid spending a safety API call on it.
       const safety = confirmation.passed
         ? await getSolanaSafety(call.contract, env)
-        : { passed: false, scorePenalty: 0, summary: "skipped: market gate failed" };
+        : { passed: false, summary: "skipped: market gate failed" };
       if (safety.summary?.includes("safety report unavailable")) throw new Error(safety.summary);
-      const effectiveScore = review.score - num(safety.scorePenalty);
-      const alerted = safety.passed && confirmation.passed && effectiveScore >= MIN_SCORE && review.marketCap <= MAX_MARKET_CAP;
+
+      let alerted = safety.passed && confirmation.passed;
       if (alerted) {
-        await sendTelegram(env, formatAlert(call, confirmation.pair, { ...review, score: effectiveScore, safety, confirmation }));
-        results.push({ contract: call.contract, alerted: true, score: effectiveScore, rawScore: review.score, safety: safety.summary });
+        alerted = await sendSwarmAlert(env, call, confirmation.pair, { ...review, safety, confirmation });
+        results.push({ contract: call.contract, alerted, safety: safety.summary });
       } else {
-        results.push({ contract: call.contract, alerted: false, score: effectiveScore, rawScore: review.score, safety: safety.summary, marketGate: confirmation.summary });
+        results.push({ contract: call.contract, alerted: false, safety: safety.summary, marketGate: confirmation.summary });
       }
       await recordLearningObservation(env, call, review, safety, confirmation, alerted).catch(() => {});
       const index = pending.findIndex((item) => item.id === call.id);
-      if (index >= 0) pending.splice(index, 1);
+      if (index >= 0) {
+        if (alerted) pending.splice(index, 1);
+        else pending.push(...pending.splice(index, 1));
+      }
       await statePut(env, JSON.stringify(pending), "seekr_pending_calls");
     } catch (error) {
       const index = pending.findIndex((item) => item.id === call.id);
@@ -470,12 +444,12 @@ async function scan(env) {
   const robinhood = { configured: false, checked: 0, skipped: "Solana-only mode" };
   const bnb = { configured: false, checked: 0, skipped: "Solana-only mode" };
   await scanProgress(env, "learning");
-  const learning = scanHasTime(env, 20_000) ? await updateLearningOutcomes(env).catch((error) => ({ error: String(error) }))
+  const learning = scanHasTime(env, 20_000) ? { skipped: "Outcome polling disabled to reserve provider budget for momentum" }
     : { skipped: "Scan time budget" };
   if (connected) {
-    await sendTelegram(env, `✅ Seekr + PumpSwap Solana tracker connected. Build: <code>${BUILD_ID}</code>. Scanning every 3 minutes from 5:00 a.m. to 8:00 p.m. Pacific.`);
+    await sendTelegram(env, `✅ Seekr + PumpSwap Solana tracker connected. Build: <code>${BUILD_ID}</code>. Scanning every minute from 5:00 a.m. to 8:00 p.m. Pacific.`);
   }
-  const degraded = Boolean(solanaMomentum.pumpSwap?.error || solanaMomentum.pumpSwap?.discoveryError ||
+  const degraded = Boolean(env._swarm?.unavailable || env._swarm?.truncated || solanaMomentum.pumpSwap?.error || solanaMomentum.pumpSwap?.discoveryError ||
     solanaMomentum.pumpSwap?.skipped || solanaMomentum.pumpSwap?.results?.some((item) => item.error) ||
     results.some((item) => item.error) || seekrDexDeferred);
   return { ok: !degraded, degraded, build: BUILD_ID, seekrChecked: results.length, seekrDeferred: seekrDexDeferred ? seekrBatch.length : 0,
@@ -534,7 +508,7 @@ async function fetchJsonWithRetry(url, options = {}, attempts = 3) {
 async function getSolanaMomentumPayloads(env) {
   const cached = JSON.parse(await stateGet(env, "solana_discovery_cache") || "null");
   const age = cached ? Date.now() - num(cached.at) : Infinity;
-  if (age >= 0 && age < 180_000) {
+  if (age >= 0 && age < 60_000) {
     return { ...cached.discovery, cached: true, cacheAgeMs: age };
   }
   try {
@@ -560,12 +534,12 @@ async function fetchSolanaMomentumPayloads(env) {
     const geckoRetryAt = Number(await stateGet(env, "gecko_provider_retry_at")) || 0;
     if (Date.now() < geckoRetryAt) throw new Error("GeckoTerminal provider cooldown until " + new Date(geckoRetryAt).toISOString());
     const payload = await requestJson(
-      "https://api.geckoterminal.com/api/v2/networks/solana/trending_pools?include=base_token&page=1",
+      `https://api.geckoterminal.com/api/v2/networks/solana/${Math.floor(Date.now()/60_000)%2 ? "new_pools" : "trending_pools"}?include=base_token&page=1`,
       { headers: { "User-Agent": "SeekrSolanaMomentum/1.1", Accept: "application/json" } },
       1
     );
     await statePut(env, 0, "gecko_provider_retry_at");
-    return { payloads: [payload], source: "geckoterminal" };
+    return { payloads: [payload], source: "geckoterminal-new-and-trending" };
   } catch (geckoError) {
     if (String(geckoError).includes("HTTP 429")) await statePut(env, Date.now() + 3 * 60_000, "gecko_provider_retry_at");
     const [profileResult, boostResult] = await Promise.allSettled([
@@ -641,11 +615,11 @@ async function scanSolanaMomentum(env) {
   try {
     const discovery = await getSolanaMomentumPayloads(env);
     const payloads = discovery.payloads;
-    await statePut(env, now + 170_000, "solana_next_attempt");
+    await statePut(env, now + 55_000, "solana_next_attempt");
     const currentAlerts = parseJsonArray(await stateGet(env, "solana_momentum_alerted"));
     const legacyPumpSwapAlerts = parseJsonArray(await stateGet(env, "pumpswap_alerted"));
     const alertHistory = [...currentAlerts, ...legacyPumpSwapAlerts]
-      .filter((item) => item?.contract && now - num(item.alertedAt) < PUMPSWAP_ALERT_COOLDOWN_MS)
+      .filter((item) => item?.contract)
       .filter((item, index, all) => all.findIndex((other) => other.contract === item.contract) === index);
     // Keep shared alert history when narrowing discovery to PumpSwap.
     const raydium = disabledMomentumSource();
@@ -696,10 +670,7 @@ async function processSolanaMomentumDex(env, payloads, config, alertHistory, now
         const changeH1 = num(attributes?.price_change_percentage?.h1);
         const changeH6 = num(attributes?.price_change_percentage?.h6);
         const momentum = Math.max(changeM5, changeH1, changeH6);
-        if (marketCap <= 0 || marketCap > MAX_PUMPSWAP_MARKET_CAP) continue;
-        if (liquidity < MIN_LIQUIDITY || volumeH1 < PUMPSWAP_MIN_H1_VOLUME) continue;
-        if (buys < PUMPSWAP_MIN_H1_BUYS || (buyers > 0 && buyers < PUMPSWAP_MIN_H1_BUYERS)) continue;
-        if (buys / Math.max(1, sells) < PUMPSWAP_MIN_BUY_SELL_RATIO || momentum < PUMPSWAP_MIN_MOMENTUM_PCT) continue;
+        if (liquidity < MIN_LIQUIDITY) continue;
         const tokenId = String(pool?.relationships?.base_token?.data?.id || "");
         const token = included.get(tokenId) || {};
         const contract = String(token.address || tokenId.replace(/^solana_/, ""));
@@ -718,6 +689,11 @@ async function processSolanaMomentumDex(env, payloads, config, alertHistory, now
       }
     }
 
+    const watchKey = "swarm_watch_" + config.dexId;
+    const watch = parseJsonArray(await stateGet(env, watchKey));
+    for (const token of tokens.values()) token.discoveredAt = now;
+    for (const token of watch) if (now-num(token.discoveredAt) < 30*60_000 && !tokens.has(token.contract)) tokens.set(token.contract,token);
+    await statePut(env, JSON.stringify([...tokens.values()].slice(-120)), watchKey);
     const lastAlert = new Map(alertHistory.map((item) => [String(item.contract), num(item.alertedAt)]));
     const eligible = [...tokens.values()]
       .filter((item) => !lastAlert.has(item.contract))
@@ -725,9 +701,11 @@ async function processSolanaMomentumDex(env, payloads, config, alertHistory, now
     const cursorKey = "momentum_cursor_" + config.dexId;
     const cursor = eligible.length ? (Number(await stateGet(env, cursorKey)) || 0) % eligible.length : 0;
     // Rotate the bounded batch so a rejected leader cannot starve every other token.
-    const candidates = [...eligible.slice(cursor), ...eligible.slice(0, cursor)].slice(0, 2);
+    const candidates = [...eligible.slice(cursor), ...eligible.slice(0, cursor)].slice(0, 6);
     const results = [];
+    if (candidates.length) await getBestPairs(candidates.map(c => c.contract), "solana", env);
     for (const call of candidates) {
+      if (await stateGet(env, "swarm_sent_" + call.contract)) continue;
       if (!scanHasTime(env, 45_000)) break;
       try {
         const pair = await getBestPair(call.contract, config.dexId, "solana", env);
@@ -737,15 +715,15 @@ async function processSolanaMomentumDex(env, payloads, config, alertHistory, now
         // the market/momentum confirmation.
         const safety = confirmation.passed
           ? await getSolanaSafety(call.contract, env)
-          : { passed: false, scorePenalty: 0, summary: "skipped: market gate failed" };
-        const effectiveScore = review.score - num(safety.scorePenalty);
-        const alerted = Boolean(pair && safety.passed && confirmation.passed && effectiveScore >= MIN_SCORE && review.marketCap <= MAX_PUMPSWAP_MARKET_CAP);
+          : { passed: false, summary: "skipped: market gate failed" };
+
+        let alerted = Boolean(pair && safety.passed && confirmation.passed);
         if (alerted) {
-          await sendTelegram(env, formatAlert(call, confirmation.pair, { ...review, score: effectiveScore, safety, confirmation }));
-          alertHistory.push({ contract: call.contract, alertedAt: now });
-          results.push({ contract: call.contract, alerted: true, score: effectiveScore, rawScore: review.score, safety: safety.summary });
+          alerted = await sendSwarmAlert(env, call, confirmation.pair, { ...review, safety, confirmation });
+          if (alerted) alertHistory.push({ contract: call.contract, alertedAt: now });
+          results.push({ contract: call.contract, alerted, safety: safety.summary });
         } else {
-          results.push({ contract: call.contract, alerted: false, score: effectiveScore, rawScore: review.score, safety: safety.summary, marketGate: confirmation.summary });
+          results.push({ contract: call.contract, alerted: false, safety: safety.summary, marketGate: confirmation.summary });
         }
         await recordLearningObservation(env, call, review, safety, confirmation, alerted).catch(() => {});
       } catch (error) {
@@ -792,13 +770,13 @@ async function scanBnb(env) {
         const call = { ...item, name: item.name || pair?.baseToken?.name || pair?.baseToken?.symbol || "BNB token", paid: false, source: "BNB" };
         const confirmation = await confirmMarketMomentum(call, pair, { chainId: BNB_CHAIN_ID, chainName: "BNB Chain", env });
         const review = confirmation.review;
-        if (pair && safety.passed && confirmation.passed && review.score >= BNB_MIN_SCORE && review.marketCap <= MAX_MARKET_CAP) {
-          await sendTelegram(env, formatAlert(call, confirmation.pair, { ...review, safety, confirmation }));
+        if (pair && safety.passed && confirmation.passed) {
+          await sendSwarmAlert(env, call, confirmation.pair, { ...review, safety, confirmation });
           await recordPaperWatch(env, call, review);
           savedAlerted.add(key);
           watch.delete(key);
-          results.push({ contract: item.contract, alerted: true, score: review.score, safety: safety.summary });
-        } else results.push({ contract: item.contract, alerted: false, score: review.score, safety: safety.summary, marketGate: confirmation.summary });
+          results.push({ contract: item.contract, alerted: true, safety: safety.summary });
+        } else results.push({ contract: item.contract, alerted: false, safety: safety.summary, marketGate: confirmation.summary });
       } catch (error) {
         results.push({ contract: item.contract, error: String(error) });
       }
@@ -930,14 +908,14 @@ async function scanRobinhood(env) {
         const call = { ...item, name: pair?.baseToken?.name || pair?.baseToken?.symbol || "Robinhood token", paid: false, source: "ROBINHOOD" };
         const confirmation = await confirmMarketMomentum(call, pair, { chainId: ROBINHOOD_CHAIN_ID, chainName: "Robinhood Chain", env });
         const review = confirmation.review;
-        if (pair && confirmation.passed && review.score >= ROBINHOOD_MIN_SCORE && review.marketCap <= MAX_MARKET_CAP) {
+        if (pair && confirmation.passed) {
           await sendTelegram(env, formatAlert(call, confirmation.pair, { ...review, confirmation }));
           await recordPaperWatch(env, call, review);
           savedAlerted.add(key);
           watch.delete(key);
-          results.push({ contract: item.contract, alerted: true, score: review.score });
+          results.push({ contract: item.contract, alerted: true });
         } else {
-          results.push({ contract: item.contract, alerted: false, score: review.score, marketGate: confirmation.summary });
+          results.push({ contract: item.contract, alerted: false, marketGate: confirmation.summary });
         }
       } catch (error) {
         results.push({ contract: item.contract, error: String(error) });
@@ -1040,13 +1018,13 @@ async function scanRaydium(env) {
         const confirmation = await confirmMarketMomentum(call, pair, { dexId: "raydium", env });
         const review = confirmation.review;
         const safety = await getSolanaSafety(call.contract, env);
-        const effectiveScore = review.score - num(safety.scorePenalty);
-        const alerted = Boolean(pair && safety.passed && confirmation.passed && effectiveScore >= MIN_SCORE && review.marketCap <= MAX_MARKET_CAP);
+
+        let alerted = Boolean(pair && safety.passed && confirmation.passed);
         if (alerted) {
-          await sendTelegram(env, formatAlert(call, confirmation.pair, { ...review, score: effectiveScore, safety, confirmation }));
-          results.push({ contract: call.contract, alerted: true, score: effectiveScore, rawScore: review.score, safety: safety.summary });
+          alerted = await sendSwarmAlert(env, call, confirmation.pair, { ...review, safety, confirmation });
+          results.push({ contract: call.contract, alerted, safety: safety.summary });
         } else {
-          results.push({ contract: call.contract, alerted: false, score: effectiveScore, rawScore: review.score, safety: safety.summary, marketGate: confirmation.summary });
+          results.push({ contract: call.contract, alerted: false, safety: safety.summary, marketGate: confirmation.summary });
         }
         await recordLearningObservation(env, call, review, safety, confirmation, alerted).catch(() => {});
       } catch (error) {
@@ -1086,8 +1064,10 @@ async function recordLearningObservation(env, call, review, safety, confirmation
       chainId: paperChainId(call.source),
       entryAt: now,
       alerted: Boolean(alerted),
-      rawScore: num(review.score),
-      effectiveScore: num(review.score) - num(safety?.scorePenalty),
+
+
+      trigger: "trade-swarm",
+      swarm: confirmation?.swarm || null,
       entry: snapshot,
       safetyPassed: Boolean(safety?.passed),
       safety: String(safety?.summary || "").slice(0, 240),
@@ -1105,8 +1085,8 @@ async function recordLearningObservation(env, call, review, safety, confirmation
     record.alerted = true;
     record.entryAt = now;
     record.entry = snapshot;
-    record.rawScore = num(review.score);
-    record.effectiveScore = num(review.score) - num(safety?.scorePenalty);
+
+
     record.checkpoints = {};
     record.minMultiple = 1;
     record.maxMultiple = 1;
@@ -1940,7 +1920,7 @@ function reviewSolanaSafety(data) {
   const details = `Rugcheck ${rugScore.toFixed(0)}; LP locked/burned ${lpLockedPct.toFixed(1)}%; creator ${creatorPct.toFixed(1)}%; top holder ${topHolderPct.toFixed(1)}%; top 10 ${top10Pct.toFixed(1)}%`;
   const warnings = [...copycatRisks, ...repeatCreatorRisks, ...secondaryPoolWarnings];
   const warning = warnings.length ? `; WARNING: ${warnings.slice(0, 3).join(", ")}` : "";
-  const scorePenalty = repeatCreatorRisks.length ? 1 : 0;
+  blockers.push(...copycatRisks.slice(0,3));
   return {
     passed: blockers.length === 0,
     summary: blockers.length ? `blocked: ${blockers.join(", ")}${warning}` : `passed; ${details}${warning}`,
@@ -1956,15 +1936,14 @@ function reviewSolanaSafety(data) {
     suspiciousHolderCount: suspiciousHolders.length,
     repeatCreatorRiskCount: repeatCreatorRisks.length,
     priorRugRiskCount: priorRugRisks.length,
-    scorePenalty,
   };
 }
 
 function passesMarketSafety(review) {
-  if (!review || !Number.isFinite(review.marketCap) || review.marketCap <= 0) return false;
+  if (!review || !Number.isFinite(review.price) || review.price <= 0) return false;
   if (review.liquidity < MIN_LIQUIDITY) return false;
-  if (review.liquidity / review.marketCap < MIN_LIQUIDITY_TO_MARKET_CAP) return false;
-  if (review.changeM5 < MAX_5M_DROP_PCT || review.changeH1 < MAX_1H_DROP_PCT) return false;
+  if (review.marketCap > 0 && review.liquidity / review.marketCap < MIN_LIQUIDITY_TO_MARKET_CAP) return false;
+  if (review.changeM5 < MAX_5M_DROP_PCT) return false;
   if (review.sells > 0 && review.buys / review.sells < MIN_BUY_SELL_RATIO) return false;
   return true;
 }
@@ -1986,29 +1965,32 @@ async function confirmMarketMomentum(call, initialPair, options = {}) {
   // Keep failures shared too: another source must not retry the same failed
   // request during this scan. Each scan starts with a new confirmation map.
   const result = await confirmation;
-  return { ...result, review: scorePair(call, result.pair, options.chainName || "Solana") };
+  return { ...result, review: reviewMarket(call, result.pair, options.chainName || "Solana") };
 }
 
 async function performMarketConfirmation(call, initialPair, options = {}) {
   const chainId = options.chainId || "solana";
   const chainName = options.chainName || "Solana";
-  const initialReview = scorePair(call, initialPair, chainName);
+  const initialReview = reviewMarket(call, initialPair, chainName);
   if (!passesMarketSafety(initialReview)) {
     return { passed: false, pair: initialPair, review: initialReview, initialReview, summary: "blocked by initial momentum gate" };
   }
 
+  const swarm = await getTradeSwarm(call.contract, initialPair, options.env);
+  if (!swarm.passed) return { passed: false, deferred: /unavailable|cooldown|stale|truncated/.test(swarm.summary), pair: initialPair, review: initialReview,
+    initialReview, swarm, summary: "blocked: " + swarm.summary };
   // A candidate must remain healthy across two observations before Telegram receives it.
   await new Promise((resolve) => setTimeout(resolve, FINAL_CONFIRM_DELAY_MS));
   const freshPair = await getBestPair(call.contract, options.dexId || null, chainId, options.env, true);
-  const freshReview = scorePair(call, freshPair, chainName);
+  const freshReview = reviewMarket(call, freshPair, chainName);
   if (!passesMarketSafety(freshReview)) {
     return { passed: false, pair: freshPair, review: freshReview, initialReview, summary: "blocked by final momentum gate" };
   }
 
   // Never confirm a token by silently switching to a different pool. A pool
   // migration, spoof pool, or fragmented launch must be reviewed separately.
-  const initialPool = String(initialPair?.pairAddress || "").toLowerCase();
-  const freshPool = String(freshPair?.pairAddress || "").toLowerCase();
+  const initialPool = String(initialPair?.pairAddress || "");
+  const freshPool = String(freshPair?.pairAddress || "");
   if (!initialPool || initialPool !== freshPool) {
     return { passed: false, pair: freshPair, review: freshReview, initialReview, summary: "blocked: selected pool changed during confirmation" };
   }
@@ -2023,50 +2005,34 @@ async function performMarketConfirmation(call, initialPair, options = {}) {
     return { passed: false, pair: freshPair, review: freshReview, initialReview, priceDropPct, liquidityDropPct, summary: "blocked: price or liquidity deteriorated during confirmation" };
   }
 
-  return { passed: true, pair: freshPair, review: freshReview, initialReview, priceDropPct, liquidityDropPct, summary: "passed two-observation momentum confirmation" };
+  return { passed: true, pair: freshPair, review: freshReview, initialReview, priceDropPct, liquidityDropPct, swarm, summary: "trade swarm detected; fresh pool check passed" };
 }
 
-function scorePair(call, pair, chainName = "Solana") {
-  if (!pair) return { score: 0, marketCap: Infinity, reasons: [`No ${chainName} pool indexed yet`] };
-  const marketCap = num(pair.marketCap || pair.fdv);
-  const liquidity = num(pair.liquidity?.usd);
-  const volumeH1 = num(pair.volume?.h1);
-  const changeM5 = num(pair.priceChange?.m5);
-  const changeH1 = num(pair.priceChange?.h1);
-  const buys = num(pair.txns?.h1?.buys);
-  const sells = num(pair.txns?.h1?.sells);
-  const ageMinutes = pair.pairCreatedAt ? (Date.now() - pair.pairCreatedAt) / 60000 : 99999;
-  let score = 0;
-  const reasons = [];
-  if (marketCap >= 20_000 && marketCap <= 1_500_000) { score += 2; reasons.push("early market cap"); }
-  else if (marketCap <= MAX_MARKET_CAP) { score += 1; reasons.push("market cap still has room"); }
-  if (liquidity >= 25_000) { score += 2; reasons.push("solid liquidity"); }
-  else if (liquidity >= MIN_LIQUIDITY) { score += 1; reasons.push("acceptable liquidity"); }
-  if (volumeH1 >= 20_000) { score += 2; reasons.push("strong 1h volume"); }
-  else if (volumeH1 >= 7_500) { score += 1; reasons.push("building 1h volume"); }
-  if (buys >= 20 && buys > sells * 1.15) { score += 1; reasons.push("buy pressure"); }
-  if (changeH1 >= 5 && changeH1 <= 250) { score += 1; reasons.push("positive momentum"); }
-  if (ageMinutes <= 180) { score += 1; reasons.push("very young pool"); }
-  if (liquidity < MIN_LIQUIDITY) { score -= 3; reasons.push("thin liquidity"); }
-  if (call.paid) { score -= 1; reasons.push("DexScreener promotion flagged"); }
-  return { score, marketCap, liquidity, volumeH1, changeM5, changeH1, buys, sells, ageMinutes, reasons };
+function reviewMarket(call, pair, chainName = "Solana") {
+  if (!pair) return { marketCap: Infinity, reasons: [`No ${chainName} pool indexed yet`] };
+  return { marketCap: num(pair.marketCap || pair.fdv), liquidity: num(pair.liquidity?.usd),
+    price: num(pair.priceUsd), volumeH1: num(pair.volume?.h1),
+    changeM5: num(pair.priceChange?.m5), changeH1: num(pair.priceChange?.h1),
+    buys: num(pair.txns?.h1?.buys), sells: num(pair.txns?.h1?.sells),
+    ageMinutes: pair.pairCreatedAt ? (Date.now()-pair.pairCreatedAt)/60000 : null,
+    reasons: ["Trade-level momentum trigger; market cap and pool age are context"] };
 }
 
 function formatAlert(call, pair, r) {
   const chainPath = call.source === "ROBINHOOD" ? "robinhood" : call.source === "BNB" ? "bsc" : "solana";
   const link = pair?.url || `https://dexscreener.com/${chainPath}/${call.contract}`;
 
-  const source = call.source === "RAYDIUM" ? "RAYDIUM" : call.source === "PUMPSWAP" ? "PUMPSWAP RESURGENCE" : call.source === "ROBINHOOD" ? "ROBINHOOD CHAIN" : call.source === "BNB" ? "BNB CHAIN" : "SEEKR";
+  const source = call.source === "RAYDIUM" ? "RAYDIUM" : call.source === "PUMPSWAP" ? "PUMPSWAP" : call.source === "ROBINHOOD" ? "ROBINHOOD CHAIN" : call.source === "BNB" ? "BNB CHAIN" : "SEEKR";
   const first = r.confirmation?.initialReview;
   const poolAddress = String(pair?.pairAddress || "unknown");
   const poolLabel = poolAddress === "unknown" ? poolAddress : `${poolAddress.slice(0, 6)}…${poolAddress.slice(-6)}`;
   const lines = [
-    `🚨 <b>${source} CANDIDATE — ${esc(call.name)}</b>`,
+    `🚨 <b>SWARM STARTING — ${esc(call.name)}</b>`,
     `Build: <code>${BUILD_ID}</code>`,
     `Pool: ${esc(String(pair?.dexId || "unknown"))} / <code>${esc(poolLabel)}</code>`,
-    `Score: <b>${r.score}/9</b>`,
+    `Source: ${source}`,
     `Market cap: <b>${usd(r.marketCap)}</b>`,
-    `Entry tier: <b>${marketCapTier(r.marketCap)}</b>`,
+
     `Liquidity: ${usd(r.liquidity)}`,
     `1h volume: ${usd(r.volumeH1)}`,
     `1h change: ${r.changeH1.toFixed(1)}%`,
@@ -2075,13 +2041,36 @@ function formatAlert(call, pair, r) {
   ];
   if (first) {
     lines.push(
-      `20s recheck: market cap ${usd(num(first.marketCap))} → ${usd(r.marketCap)}; liquidity ${usd(num(first.liquidity))} → ${usd(r.liquidity)}`,
+      `5s recheck: market cap ${usd(num(first.marketCap))} → ${usd(r.marketCap)}; liquidity ${usd(num(first.liquidity))} → ${usd(r.liquidity)}`,
       `Recheck result: ${esc(r.confirmation.summary)}`,
     );
   }
+  const swarm = r.confirmation?.swarm;
+  if (swarm) lines.push(
+    `Distinct buyers / minute: ${swarm.previousBuyers} → ${swarm.buyers}; ${swarm.newBuyers} newly active`,
+    `Last minute: buys ${usd(swarm.buyUsd)} / sells ${usd(swarm.sellUsd)}; net ${usd(swarm.netBuyUsd)}`,
+    `Buyer acceleration: ${swarm.buyerAcceleration.toFixed(2)}×; buy-dollar acceleration: ${swarm.dollarAcceleration.toFixed(2)}×`,
+    "Distinct wallets do not establish independent ownership."
+  );
   if (r.safety) lines.push(`Safety: ${esc(r.safety.summary)}`);
   lines.push(`CA: <a href="${link}">${call.contract}</a>`, "⚠️ Preliminary alert only—verify holders, insiders, bundlers and socials before risking money.");
   return lines.join("\n");
+}
+
+async function sendSwarmAlert(env, call, pair, review) {
+  if (!review.confirmation?.swarm?.passed || Date.now() - review.confirmation.swarm.observedAt > 60_000) return false;
+  const key = "swarm_sent_" + call.contract;
+  if (!review.safety?.passed) return false;
+  if (await stateGet(env, key)) return false;
+  // Import available historical alerts before sending a first swarm alert.
+  const history = [...parseJsonArray(await stateGet(env, "solana_momentum_alerted")),
+    ...parseJsonArray(await stateGet(env, "pumpswap_alerted"))];
+  if (history.some(x => x.contract === call.contract)) {
+    await statePut(env, "legacy-alert", key); return false;
+  }
+  await sendTelegram(env, formatAlert(call, pair, review));
+  await statePut(env, new Date().toISOString(), key);
+  return true;
 }
 
 async function sendTelegram(env, text) {
@@ -2126,3 +2115,24 @@ function usd(value) { return Number.isFinite(value) ? `$${Math.round(value).toLo
 function esc(value) { return String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
 function parseJsonArray(value) { try { const v = JSON.parse(value || "[]"); return Array.isArray(v) ? v : []; } catch { return []; } }
 async function check(response) { if (!response.ok) throw new Error(`${response.url ? new URL(response.url).hostname : "unknown provider"} HTTP ${response.status}`); return response; }
+
+async function getTradeSwarm(contract, pair, env) {
+  if (!pair?.pairAddress) return { passed: false, summary: "Pool unavailable" };
+  env._swarm ||= { checked: 0, unavailable: 0, truncated: 0 };
+  const retryAt = Number(await stateGet(env, "gecko_provider_retry_at")) || 0;
+  if (Date.now() < retryAt) { env._swarm.unavailable++; return { passed: false, summary: "Trade provider cooldown" }; }
+  try {
+    const response = await providerFetch(env,
+      `https://api.geckoterminal.com/api/v2/networks/solana/pools/${pair.pairAddress}/trades`);
+    if (response.status === 429) await statePut(env, Date.now()+180_000, "gecko_provider_retry_at");
+    const payload = await check(response).then(r => r.json());
+    const result = detectSwarm(payload, contract, Date.now());
+    env._swarm.checked++;
+    if (/unavailable|stale|Incomplete|Invalid|Unknown|Future/.test(result.summary)) env._swarm.unavailable++;
+    if (/truncated/.test(result.summary)) env._swarm.truncated++;
+    return result;
+  } catch (error) {
+    env._swarm.unavailable++;
+    return { passed: false, summary: "Trade feed unavailable: " + String(error) };
+  }
+}
