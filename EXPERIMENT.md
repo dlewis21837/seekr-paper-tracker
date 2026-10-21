@@ -14,7 +14,7 @@ Create a separate Cloudflare Worker from this repository's `momentum-swarm-v42` 
 npx wrangler deploy --config wrangler.experiment.jsonc
 ```
 
-The Worker name is `solana-swarm-experiment`. Existing secrets on another Worker are not inherited. The configuration enables only free launch/migration discovery: trade-event limit is zero and Telegram is off. `/status` shows live connection state, counters, up to 20 recent discoveries and up to 100 swarm observations. A one-minute cron/alarm is a recovery heartbeat; token events themselves arrive through one persistent WebSocket. Outside 5 a.m.–8 p.m. Pacific the listener disconnects.
+The Worker name is `solana-swarm-experiment`. Existing secrets on another Worker are not inherited. The configuration enables only free launch/migration discovery: trade-event limit is zero; Telegram observation delivery is enabled but requires its secrets and a working trade feed. `/status` shows live connection state, counters, up to 20 recent discoveries and up to 100 swarm observations. A one-minute cron/alarm is a recovery heartbeat; token events themselves arrive through one persistent WebSocket. Outside 5 a.m.–8 p.m. Pacific the listener disconnects.
 
 Cloudflare outbound WebSockets do not hibernate, so Cloudflare runtime/storage usage may incur hosting costs. Free PumpPortal discovery does not mean all hosting is free. No hosting or data service was purchased by this change.
 
@@ -24,7 +24,7 @@ Cloudflare outbound WebSockets do not hibernate, so Cloudflare runtime/storage u
 2. PumpPortal requires at least 0.02 SOL in the linked wallet for trade subscriptions. This is provider data funding, not a token purchase. Use only funds set aside for the experiment.
 3. Add the API key as the Cloudflare secret `PUMPPORTAL_API_KEY` on this separate Worker.
 4. Set `DAILY_TRADE_EVENT_LIMIT` to a deliberate positive limit. The implementation caps this at 10,000 received trade events per UTC day; default 0 disables metered subscriptions. PumpPortal documents 0.01 SOL per 10,000 trade events. This software cutoff is NOT a guaranteed billing cap: buffered events, provider rounding, other consumers of the same key and billing policy can affect charges. Keep a small dedicated balance and do not use the key elsewhere.
-5. For Telegram observations, copy your existing `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` into secrets for this Worker and set `EXPERIMENT_TELEGRAM_ENABLED=true`. Every message is explicitly labeled EXPERIMENT and safety not evaluated. No messages are sent until this opt-in is configured.
+5. For Telegram observations, copy your existing `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` into secrets for this Worker (`EXPERIMENT_TELEGRAM_ENABLED=true` is already set at the user’s request). Every message is explicitly labeled EXPERIMENT and safety not evaluated. Messages require both Telegram secrets and a passing live swarm observation.
 
 ## Experiment scope and limitations
 
