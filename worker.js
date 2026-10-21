@@ -1,14 +1,14 @@
 const SCANNER_PAUSED = false; // Original scanner resumed by user.
 const CHANNEL = "SeekrTrending";
 const PAPER_TRACKING_ENABLED = false;
-const BUILD_ID = "scanner-v40-discovery-recovery-2026-10-15";
+const BUILD_ID = "scanner-v41-strict-quality-2026-10-20";
 const HEALTH_UPDATE_CRONS = ["49,59 18 1 10 *", "9,19,29,39 19 1 10 *"];
 const HEALTH_UPDATE_START = Date.parse("2026-10-01T18:49:00Z");
 const HEALTH_UPDATE_END = Date.parse("2026-10-01T19:39:00Z");
 const MAX_MARKET_CAP = 3_000_000;
 const MAX_PUMPSWAP_MARKET_CAP = 2_000_000;
 const MIN_LIQUIDITY = 10_000;
-const MIN_SCORE = 1;
+const MIN_SCORE = 9; // Strict quality threshold; safety and confirmation remain mandatory.
 const FINAL_CONFIRM_DELAY_MS = 20_000;
 const MAX_5M_DROP_PCT = -15;
 const MAX_1H_DROP_PCT = -30;
