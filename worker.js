@@ -1,7 +1,7 @@
 const SCANNER_PAUSED = false; // Original scanner resumed by user.
 const CHANNEL = "SeekrTrending";
 const PAPER_TRACKING_ENABLED = false;
-const BUILD_ID = "scanner-v42-market-fallback-2026-10-21";
+const BUILD_ID = "scanner-v43-dex-only-2026-10-24";
 const HEALTH_UPDATE_CRONS = ["49,59 18 1 10 *", "9,19,29,39 19 1 10 *"];
 const HEALTH_UPDATE_START = Date.parse("2026-10-01T18:49:00Z");
 const HEALTH_UPDATE_END = Date.parse("2026-10-01T19:39:00Z");
@@ -562,22 +562,8 @@ async function getSolanaMomentumPayloads(env) {
 }
 
 async function fetchSolanaMomentumPayloads(env) {
-  const requestJson = (url, options = {}, attempts = 1) =>
-    new URL(url).hostname === "api.dexscreener.com"
-      ? marketPairsJson(env, url, options)
-      : geckoJson(env, url, options);
-  try {
-    const geckoRetryAt = Number(await stateGet(env, "gecko_provider_retry_at")) || 0;
-    if (Date.now() < geckoRetryAt) throw new Error("GeckoTerminal provider cooldown until " + new Date(geckoRetryAt).toISOString());
-    const payload = await requestJson(
-      "https://api.geckoterminal.com/api/v2/networks/solana/trending_pools?include=base_token&page=1",
-      { headers: { "User-Agent": "SeekrSolanaMomentum/1.1", Accept: "application/json" } },
-      1
-    );
-    await statePut(env, 0, "gecko_provider_retry_at");
-    return { payloads: [payload], source: "geckoterminal" };
-  } catch (geckoError) {
-    if (String(geckoError).includes("HTTP 429")) await statePut(env, Date.now() + 3 * 60_000, "gecko_provider_retry_at");
+  // DexScreener discovery uses its own paced request bucket. Gecko is no longer a runtime dependency.
+  const requestJson = (url, options = {}) => marketPairsJson(env, url, options);
     const [profileResult, boostResult] = await Promise.allSettled([
       requestJson("https://api.dexscreener.com/token-profiles/latest/v1", {
         headers: { "User-Agent": "SeekrSolanaMomentum/1.1", Accept: "application/json" },
@@ -588,13 +574,13 @@ async function fetchSolanaMomentumPayloads(env) {
     ]);
     const profiles = profileResult.status === "fulfilled" ? profileResult.value : [];
     const boosts = boostResult.status === "fulfilled" ? boostResult.value : [];
-    if (!profiles.length && !boosts.length) throw new Error(`All Solana discovery providers failed: GeckoTerminal ${String(geckoError)}; profiles ${String(profileResult.reason)}; boosts ${String(boostResult.reason)}`);
+    if (!profiles.length && !boosts.length) throw new Error(`DexScreener discovery unavailable: profiles ${String(profileResult.reason)}; boosts ${String(boostResult.reason)}`);
     const addresses = [...new Set([...profiles, ...boosts]
       .filter((item) => item?.chainId === "solana")
       .map((item) => String(item?.tokenAddress || ""))
       .filter((address) => /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(address))
     )].slice(0, 30);
-    if (!addresses.length) throw new Error(`GeckoTerminal unavailable (${String(geckoError)}); DexScreener fallback returned no Solana tokens`);
+    if (!addresses.length) throw new Error("DexScreener discovery returned no Solana tokens");
     const pairs = await requestJson(
       `https://api.dexscreener.com/tokens/v1/solana/${addresses.join(",")}`,
       { headers: { "User-Agent": "SeekrSolanaMomentum/1.1", Accept: "application/json" } },
@@ -633,8 +619,7 @@ async function fetchSolanaMomentumPayloads(env) {
         },
       });
     }
-    return { payloads: [{ data, included: [...included.values()] }], source: "dexscreener-fallback", geckoError: String(geckoError) };
-  }
+    return { payloads: [{ data, included: [...included.values()] }], source: "dexscreener" };
 }
 
 function disabledMomentumSource() {
@@ -1849,21 +1834,8 @@ function geckoMarketPairs(payload, contract) {
 }
 
 async function marketPairsJson(env, url, options = {}) {
-  try {
-    return await dexJson(env, url, options);
-  } catch (error) {
-    const path = new URL(url).pathname;
-    const match = path.match(/^\/(?:token-pairs|tokens)\/v1\/solana\/([1-9A-HJ-NP-Za-km-z,]+)$/);
-    if (!match || !isDexDeferral(error)) throw error;
-    const pairs = [];
-    for (const contract of [...new Set(match[1].split(","))]) {
-      const payload = await geckoJson(env,
-        "https://api.geckoterminal.com/api/v2/networks/solana/tokens/" + contract + "/pools?include=base_token,quote_token,dex&page=1");
-      pairs.push(...geckoMarketPairs(payload, contract));
-    }
-    if (env._dex) env._dex.marketFallbackRequests = num(env._dex.marketFallbackRequests) + 1;
-    return pairs;
-  }
+  // Preserve DexScreener deferral errors so existing queues retain pending candidates.
+  return dexJson(env, url, options);
 }
 
 async function dexJson(env, url, options = {}) {
@@ -2206,3 +2178,4 @@ function usd(value) { return Number.isFinite(value) ? `$${Math.round(value).toLo
 function esc(value) { return String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
 function parseJsonArray(value) { try { const v = JSON.parse(value || "[]"); return Array.isArray(v) ? v : []; } catch { return []; } }
 async function check(response) { if (!response.ok) throw new Error(`${response.url ? new URL(response.url).hostname : "unknown provider"} HTTP ${response.status}`); return response; }
+
