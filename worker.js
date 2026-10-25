@@ -1,7 +1,7 @@
 const SCANNER_PAUSED = false; // Original scanner resumed by user.
 const CHANNEL = "SeekrTrending";
 const PAPER_TRACKING_ENABLED = false;
-const BUILD_ID = "scanner-v44-direct-dex-2026-10-25";
+const BUILD_ID = "scanner-v45-token-batch-2026-10-25";
 const HEALTH_UPDATE_CRONS = ["49,59 18 1 10 *", "9,19,29,39 19 1 10 *"];
 const HEALTH_UPDATE_START = Date.parse("2026-10-01T18:49:00Z");
 const HEALTH_UPDATE_END = Date.parse("2026-10-01T19:39:00Z");
@@ -1732,7 +1732,7 @@ async function getBestPair(contract, dexId = null, chainId = "solana", env, forc
   let data = !forceFresh && env?._dex?.cache.get(key);
   if (data) env._dex.cacheHits += 1;
   else {
-    data = await marketPairsJson(env, `https://api.dexscreener.com/token-pairs/v1/${chainId}/${contract}`);
+    data = await marketPairsJson(env, `https://api.dexscreener.com/tokens/v1/${chainId}/${contract}`);
     env?._dex?.cache.set(key, data);
   }
   return selectBestPair(data, contract, dexId, chainId);
