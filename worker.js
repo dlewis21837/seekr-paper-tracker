@@ -211,11 +211,15 @@ export class State {
         const budget = (await tx.get(budgetKey)) || (await tx.get("dex_budget")) || {};
         if (num(budget.retryAt) > now) return { allowed: false, retryAt: budget.retryAt, reason: "DexScreener provider cooldown" };
         if (now - num(budget.windowAt) >= 60_000) { budget.windowAt = now; budget.count = 0; }
-        const limit = priority === "paper" ? 40 : 30;
+        const limit = 6; // Conservative shared-provider pacing.
         if (num(budget.count) >= limit) return { allowed: false, retryAt: budget.windowAt + 60_000, reason: "DexScreener request budget" };
+        const globalNextAt = num(await tx.get("dex_global_next_at"));
+        if (globalNextAt - now > 10_000) return { allowed: false, retryAt: globalNextAt, reason: "DexScreener provider cooldown" };
+        if (globalNextAt > now) return { allowed: false, waitMs: globalNextAt - now };
         if (num(budget.nextAt) > now) return { allowed: false, waitMs: budget.nextAt - now };
         budget.count = num(budget.count) + 1;
-        budget.nextAt = now + 1_000;
+        budget.nextAt = now + 10_000;
+        await tx.put("dex_global_next_at", budget.nextAt);
         await tx.put(budgetKey, budget);
         return { allowed: true };
       });
@@ -227,9 +231,11 @@ export class State {
       const result = await this.storage.transaction(async (tx) => {
         const budget = (await tx.get(budgetKey)) || (await tx.get("dex_budget")) || {};
         budget.strikes = Math.min(4, num(budget.strikes) + 1);
-        const delay = Math.min(15 * 60_000, Math.max(num(retryAfterMs), 60_000 * (2 ** (budget.strikes - 1))));
+        const delay = Math.max(num(retryAfterMs), Math.min(60 * 60_000, 5 * 60_000 * (2 ** (budget.strikes - 1))));
         budget.retryAt = Math.max(num(budget.retryAt), Date.now() + delay);
         await tx.put(budgetKey, budget);
+        const globalNextAt = num(await tx.get("dex_global_next_at"));
+        await tx.put("dex_global_next_at", Math.max(globalNextAt, budget.retryAt));
         return { retryAt: budget.retryAt };
       });
       return Response.json(result);
@@ -2183,4 +2189,5 @@ function usd(value) { return Number.isFinite(value) ? `$${Math.round(value).toLo
 function esc(value) { return String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
 function parseJsonArray(value) { try { const v = JSON.parse(value || "[]"); return Array.isArray(v) ? v : []; } catch { return []; } }
 async function check(response) { if (!response.ok) throw new Error(`${response.url ? new URL(response.url).hostname : "unknown provider"} HTTP ${response.status}`); return response; }
+
 
