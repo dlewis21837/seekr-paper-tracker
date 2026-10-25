@@ -1,7 +1,7 @@
 const SCANNER_PAUSED = false; // Original scanner resumed by user.
 const CHANNEL = "SeekrTrending";
 const PAPER_TRACKING_ENABLED = false;
-const BUILD_ID = "scanner-v43-dex-only-2026-10-24";
+const BUILD_ID = "scanner-v44-direct-dex-2026-10-25";
 const HEALTH_UPDATE_CRONS = ["49,59 18 1 10 *", "9,19,29,39 19 1 10 *"];
 const HEALTH_UPDATE_START = Date.parse("2026-10-01T18:49:00Z");
 const HEALTH_UPDATE_END = Date.parse("2026-10-01T19:39:00Z");
@@ -510,7 +510,12 @@ async function persistSeekrDexRetry(env) {
 }
 
 async function providerFetch(env, url, options = {}) {
-  if (!env?.STATE) return fetch(url, { ...options, signal: AbortSignal.timeout(15_000) });
+  // Keep DexScreener requests on the Worker fetch path. Pinning every request
+  // to one Durable Object gateway tied all scans to a provider-blocked egress.
+  // dexJson still enforces the shared request budget and Retry-After backoff.
+  if (new URL(url).hostname === "api.dexscreener.com" || !env?.STATE) {
+    return fetch(url, { ...options, signal: AbortSignal.timeout(15_000) });
+  }
   const gateway = env.STATE.get(env.STATE.idFromName("provider_gateway_wnam_v1"), { locationHint: "wnam" });
   return gateway.fetch("https://state/provider-fetch", {
     method: "POST", body: JSON.stringify({ url, headers: options.headers || {} }),
