@@ -211,15 +211,20 @@ export class State {
         const budget = (await tx.get(budgetKey)) || (await tx.get("dex_budget")) || {};
         if (num(budget.retryAt) > now) return { allowed: false, retryAt: budget.retryAt, reason: "DexScreener provider cooldown" };
         if (now - num(budget.windowAt) >= 60_000) { budget.windowAt = now; budget.count = 0; }
-        const limit = 6; // Conservative shared-provider pacing.
-        if (num(budget.count) >= limit) return { allowed: false, retryAt: budget.windowAt + 60_000, reason: "DexScreener request budget" };
+        // One provider-wide quota shared by discovery and pair lookups.
+        // Endpoint-specific cooldowns remain isolated for safe failover.
+        const shared = (await tx.get("dex_shared_budget")) || {};
+        if (now - num(shared.windowAt) >= 60_000) { shared.windowAt = now; shared.count = 0; }
+        const limit = 6;
+        if (num(shared.count) >= limit) return { allowed: false, retryAt: shared.windowAt + 60_000, reason: "DexScreener shared request budget" };
         // Migrate the legacy global backoff: this key now controls pacing only.
         const storedNextAt = num(await tx.get("dex_global_next_at"));
         const globalNextAt = storedNextAt - now > 10_000 ? 0 : storedNextAt;
         if (globalNextAt > now) return { allowed: false, waitMs: globalNextAt - now };
         if (num(budget.nextAt) > now) return { allowed: false, waitMs: budget.nextAt - now };
-        budget.count = num(budget.count) + 1;
+        shared.count = num(shared.count) + 1;
         budget.nextAt = now + 10_000;
+        await tx.put("dex_shared_budget", shared);
         await tx.put("dex_global_next_at", budget.nextAt);
         await tx.put(budgetKey, budget);
         return { allowed: true };
