@@ -1,7 +1,7 @@
 const SCANNER_PAUSED = false; // Original scanner resumed by user.
 const CHANNEL = "SeekrTrending";
 const PAPER_TRACKING_ENABLED = false;
-const BUILD_ID = "scanner-v45-token-batch-2026-10-25";
+const BUILD_ID = "scanner-v46-provider-failover-2026-10-27";
 const HEALTH_UPDATE_CRONS = ["49,59 18 1 10 *", "9,19,29,39 19 1 10 *"];
 const HEALTH_UPDATE_START = Date.parse("2026-10-01T18:49:00Z");
 const HEALTH_UPDATE_END = Date.parse("2026-10-01T19:39:00Z");
@@ -213,8 +213,9 @@ export class State {
         if (now - num(budget.windowAt) >= 60_000) { budget.windowAt = now; budget.count = 0; }
         const limit = 6; // Conservative shared-provider pacing.
         if (num(budget.count) >= limit) return { allowed: false, retryAt: budget.windowAt + 60_000, reason: "DexScreener request budget" };
-        const globalNextAt = num(await tx.get("dex_global_next_at"));
-        if (globalNextAt - now > 10_000) return { allowed: false, retryAt: globalNextAt, reason: "DexScreener provider cooldown" };
+        // Migrate the legacy global backoff: this key now controls pacing only.
+        const storedNextAt = num(await tx.get("dex_global_next_at"));
+        const globalNextAt = storedNextAt - now > 10_000 ? 0 : storedNextAt;
         if (globalNextAt > now) return { allowed: false, waitMs: globalNextAt - now };
         if (num(budget.nextAt) > now) return { allowed: false, waitMs: budget.nextAt - now };
         budget.count = num(budget.count) + 1;
@@ -231,11 +232,11 @@ export class State {
       const result = await this.storage.transaction(async (tx) => {
         const budget = (await tx.get(budgetKey)) || (await tx.get("dex_budget")) || {};
         budget.strikes = Math.min(4, num(budget.strikes) + 1);
-        const delay = Math.max(num(retryAfterMs), Math.min(60 * 60_000, 5 * 60_000 * (2 ** (budget.strikes - 1))));
+        const delay = Math.max(num(retryAfterMs), Math.min(5 * 60_000, 30_000 * (2 ** (budget.strikes - 1))));
         budget.retryAt = Math.max(num(budget.retryAt), Date.now() + delay);
         await tx.put(budgetKey, budget);
-        const globalNextAt = num(await tx.get("dex_global_next_at"));
-        await tx.put("dex_global_next_at", Math.max(globalNextAt, budget.retryAt));
+        // Endpoint families have different provider limits. Keep normal pacing
+        // shared, but never turn discovery's backoff into a market-data outage.
         return { retryAt: budget.retryAt };
       });
       return Response.json(result);
@@ -316,7 +317,7 @@ async function runScan(env) {
   try {
     await scanProgress(env, "starting", at);
     const result = await scan(env);
-    const status = { at, completedAt: new Date().toISOString(), ok: result.ok, degraded: result.degraded || false, seekrChecked: result.seekrChecked ?? 0,
+    const status = { at, completedAt: new Date().toISOString(), completedBuild: BUILD_ID, ok: result.ok, degraded: result.degraded || false, seekrChecked: result.seekrChecked ?? 0,
       seekrErrors: (result.seekrResults || []).filter((item) => item.error).length,
       seekrDeferred: result.seekrDeferred ?? 0,
       seekrPending: result.seekrPending ?? 0, seekrRetryAt: result.seekrRetryAt || null,
@@ -559,7 +560,16 @@ async function getSolanaMomentumPayloads(env) {
     return { ...cached.discovery, cached: true, cacheAgeMs: age };
   }
   try {
-    const discovery = await fetchSolanaMomentumPayloads(env);
+    let discovery;
+    try {
+      discovery = await fetchSolanaMomentumPayloads(env);
+    } catch (dexError) {
+      const payload = await geckoJson(env,
+        "https://api.geckoterminal.com/api/v2/networks/solana/trending_pools?include=base_token,quote_token,dex&duration=1h");
+      if (!Array.isArray(payload?.data)) throw new Error("GeckoTerminal discovery response unavailable");
+      discovery = { payloads: [payload], source: "geckoterminal", fallbackReason: String(dexError) };
+      if (env._dex) env._dex.marketFallbackRequests = num(env._dex.marketFallbackRequests) + 1;
+    }
     if (discovery.payloads.some((payload) => payload?.data?.length)) {
       await statePut(env, JSON.stringify({ at: Date.now(), discovery }), "solana_discovery_cache");
     }
@@ -597,6 +607,12 @@ async function fetchSolanaMomentumPayloads(env) {
       { headers: { "User-Agent": "SeekrSolanaMomentum/1.1", Accept: "application/json" } },
       2
     );
+    // The batch already contains each token's complete pool set. Reuse it for
+    // the initial review; confirmation still forces a separate fresh request.
+    for (const address of addresses) {
+      env?._dex?.cache.set("solana:" + address, (Array.isArray(pairs) ? pairs : [])
+        .filter((pair) => pair.chainId === "solana" && pair.baseToken?.address === address));
+    }
     const included = new Map();
     const data = [];
     for (const pair of Array.isArray(pairs) ? pairs : []) {
@@ -1845,8 +1861,28 @@ function geckoMarketPairs(payload, contract) {
 }
 
 async function marketPairsJson(env, url, options = {}) {
-  // Preserve DexScreener deferral errors so existing queues retain pending candidates.
-  return dexJson(env, url, options);
+  try {
+    return await dexJson(env, url, options);
+  } catch (dexError) {
+    // Discovery is handled separately. Fail over only exact Solana token-pool
+    // lookups, with the same base/quote and pool-integrity checks downstream.
+    const match = new URL(url).pathname.match(/^\/tokens\/v1\/solana\/([^/]+)$/);
+    if (!match || !scanHasTime(env, 20_000)) throw dexError;
+    const addresses = [...new Set(match[1].split(","))];
+    if (addresses.some((address) => !/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(address))) throw dexError;
+    const pairs = [];
+    for (const address of addresses) {
+      try {
+        const payload = await geckoJson(env,
+          `https://api.geckoterminal.com/api/v2/networks/solana/tokens/${address}/pools?include=base_token,quote_token,dex`);
+        pairs.push(...geckoMarketPairs(payload, address));
+        if (env._dex) env._dex.marketFallbackRequests = num(env._dex.marketFallbackRequests) + 1;
+      } catch (fallbackError) {
+        throw new Error(`Market providers unavailable: ${String(dexError)}; ${String(fallbackError)}`);
+      }
+    }
+    return pairs;
+  }
 }
 
 async function dexJson(env, url, options = {}) {
@@ -2063,6 +2099,10 @@ async function performMarketConfirmation(call, initialPair, options = {}) {
   await new Promise((resolve) => setTimeout(resolve, delay));
   const freshPair = await getBestPair(call.contract, options.dexId || null, chainId, options.env, true);
   const freshReview = scorePair(call, freshPair, chainName);
+  if ((initialPair?.marketDataSource || "dexscreener") !== (freshPair?.marketDataSource || "dexscreener")) {
+    return { passed: false, pair: freshPair, review: freshReview, initialReview,
+      summary: "blocked: market provider changed during confirmation; needs two observations from the same provider" };
+  }
   if (!passesMarketSafety(freshReview)) {
     return { passed: false, pair: freshPair, review: freshReview, initialReview, summary: "blocked by final momentum gate" };
   }
@@ -2189,5 +2229,6 @@ function usd(value) { return Number.isFinite(value) ? `$${Math.round(value).toLo
 function esc(value) { return String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
 function parseJsonArray(value) { try { const v = JSON.parse(value || "[]"); return Array.isArray(v) ? v : []; } catch { return []; } }
 async function check(response) { if (!response.ok) throw new Error(`${response.url ? new URL(response.url).hostname : "unknown provider"} HTTP ${response.status}`); return response; }
+
 
 
