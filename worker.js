@@ -1,7 +1,7 @@
 const SCANNER_PAUSED = false; // Original scanner resumed by user.
 const CHANNEL = "SeekrTrending";
 const PAPER_TRACKING_ENABLED = false;
-const BUILD_ID = "scanner-v46-provider-failover-2026-10-27";
+const BUILD_ID = "scanner-v47-direct-gecko-2026-10-27";
 const HEALTH_UPDATE_CRONS = ["49,59 18 1 10 *", "9,19,29,39 19 1 10 *"];
 const HEALTH_UPDATE_START = Date.parse("2026-10-01T18:49:00Z");
 const HEALTH_UPDATE_END = Date.parse("2026-10-01T19:39:00Z");
@@ -520,7 +520,7 @@ async function providerFetch(env, url, options = {}) {
   // Keep DexScreener requests on the Worker fetch path. Pinning every request
   // to one Durable Object gateway tied all scans to a provider-blocked egress.
   // dexJson still enforces the shared request budget and Retry-After backoff.
-  if (new URL(url).hostname === "api.dexscreener.com" || !env?.STATE) {
+  if (["api.dexscreener.com", "api.geckoterminal.com"].includes(new URL(url).hostname) || !env?.STATE) {
     return fetch(url, { ...options, signal: AbortSignal.timeout(15_000) });
   }
   const gateway = env.STATE.get(env.STATE.idFromName("provider_gateway_wnam_v1"), { locationHint: "wnam" });
