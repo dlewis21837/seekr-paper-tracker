@@ -452,7 +452,7 @@ async function scan(env) {
         : { passed: false, scorePenalty: 0, summary: "skipped: market gate failed" };
       if (safety.summary?.includes("safety report unavailable")) throw new Error(safety.summary);
       const effectiveScore = review.score - num(safety.scorePenalty);
-      const alerted = safety.passed && confirmation.passed && effectiveScore >= MIN_SCORE && review.marketCap <= MAX_MARKET_CAP;
+      const alerted = safety.passed && confirmation.passed && passesSellingFilter(review, confirmation) && effectiveScore >= MIN_SCORE && review.marketCap <= MAX_MARKET_CAP;
       if (alerted) {
         await sendTelegram(env, formatAlert(call, confirmation.pair, { ...review, score: effectiveScore, safety, confirmation }));
         results.push({ contract: call.contract, alerted: true, score: effectiveScore, rawScore: review.score, safety: safety.summary });
@@ -761,7 +761,7 @@ async function processSolanaMomentumDex(env, payloads, config, alertHistory, now
           ? await getSolanaSafety(call.contract, env)
           : { passed: false, scorePenalty: 0, summary: "skipped: market gate failed" };
         const effectiveScore = review.score - num(safety.scorePenalty);
-        const alerted = Boolean(pair && safety.passed && confirmation.passed && effectiveScore >= MIN_SCORE && review.marketCap <= MAX_PUMPSWAP_MARKET_CAP);
+        const alerted = Boolean(pair && safety.passed && confirmation.passed && passesSellingFilter(review, confirmation) && effectiveScore >= MIN_SCORE && review.marketCap <= MAX_PUMPSWAP_MARKET_CAP);
         if (alerted) {
           await sendTelegram(env, formatAlert(call, confirmation.pair, { ...review, score: effectiveScore, safety, confirmation }));
           alertHistory.push({ contract: call.contract, alertedAt: now });
@@ -1063,7 +1063,7 @@ async function scanRaydium(env) {
         const review = confirmation.review;
         const safety = await getSolanaSafety(call.contract, env);
         const effectiveScore = review.score - num(safety.scorePenalty);
-        const alerted = Boolean(pair && safety.passed && confirmation.passed && effectiveScore >= MIN_SCORE && review.marketCap <= MAX_MARKET_CAP);
+        const alerted = Boolean(pair && safety.passed && confirmation.passed && passesSellingFilter(review, confirmation) && effectiveScore >= MIN_SCORE && review.marketCap <= MAX_MARKET_CAP);
         if (alerted) {
           await sendTelegram(env, formatAlert(call, confirmation.pair, { ...review, score: effectiveScore, safety, confirmation }));
           results.push({ contract: call.contract, alerted: true, score: effectiveScore, rawScore: review.score, safety: safety.summary });
@@ -2154,40 +2154,18 @@ function scorePair(call, pair, chainName = "Solana") {
   return { score, marketCap, liquidity, volumeH1, changeM5, changeH1, buys, sells, ageMinutes, reasons };
 }
 
-// Transaction counts are not buy/sell dollar flow. Report them honestly.
-// This diagnostic uses the existing market confirmation snapshots and makes
-// no extra API requests, preserving the scanner's provider budget.
-function sellingPressureDiagnostic(review, first) {
-  const buys = num(review.buys);
-  const sells = num(review.sells);
-  const ratio = buys / Math.max(1, sells);
-  const lines = [
-    `Selling pressure (1h tx count): ${buys} buys / ${sells} sells; ratio ${ratio.toFixed(2)}x`,
-  ];
-  if (!first) {
-    lines.push("Absorption: unverified (no comparable earlier snapshot)");
-    return lines;
-  }
-  const oldLiquidity = num(first.liquidity);
-  const newLiquidity = num(review.liquidity);
-  const oldCap = num(first.marketCap);
-  const newCap = num(review.marketCap);
-  if (oldLiquidity <= 0 || oldCap <= 0 || newLiquidity <= 0 || newCap <= 0) {
-    lines.push("Absorption: unverified (missing comparable price/liquidity data)");
-    return lines;
-  }
-  const capChange = (newCap / oldCap - 1) * 100;
-  const liqChange = (newLiquidity / oldLiquidity - 1) * 100;
-  const oldRatio = num(first.buys) / Math.max(1, num(first.sells));
-  lines.push(`Recheck: cap ${capChange >= 0 ? "+" : ""}${capChange.toFixed(1)}%; liquidity ${liqChange >= 0 ? "+" : ""}${liqChange.toFixed(1)}%; 1h tx ratio ${oldRatio.toFixed(2)}x → ${ratio.toFixed(2)}x`);
-  if (sells > buys || capChange < -8 || liqChange < -15) {
-    lines.push("SELLING WARNING: pressure or price/liquidity deterioration; avoid assuming support");
-  } else if (capChange >= 0 && liqChange >= -5 && ratio >= 1.2) {
-    lines.push("BUY SUPPORT OBSERVED: positive recheck; sell-shock absorption NOT yet proven");
-  } else {
-    lines.push("Absorption: inconclusive; no verified sell shock and recovery");
-  }
-  return lines;
+// Conservative BUY qualification using existing confirmation snapshots.
+// Counts are a proxy only; dollar-based absorption is not available here.
+function passesSellingFilter(review, confirmation) {
+  const first = confirmation?.initialReview;
+  if (!first || !confirmation?.passed) return false;
+  const buys = num(review.buys), sells = num(review.sells);
+  const oldCap = num(first.marketCap), cap = num(review.marketCap);
+  const oldLiquidity = num(first.liquidity), liquidity = num(review.liquidity);
+  if (buys < 20 || sells < 1 || buys / Math.max(1, sells) < 1.5) return false;
+  if (oldCap <= 0 || cap <= 0 || oldLiquidity <= 0 || liquidity <= 0) return false;
+  if (cap < oldCap * 0.98 || liquidity < oldLiquidity * 0.95) return false;
+  return true;
 }
 
 function formatAlert(call, pair, r) {
@@ -2199,7 +2177,7 @@ function formatAlert(call, pair, r) {
   const poolAddress = String(pair?.pairAddress || "unknown");
   const poolLabel = poolAddress === "unknown" ? poolAddress : `${poolAddress.slice(0, 6)}…${poolAddress.slice(-6)}`;
   const lines = [
-    `🚨 <b>${source} CANDIDATE — ${esc(call.name)}</b>`,
+    `🚨 <b>${source} BUY CANDIDATE — ${esc(call.name)}</b>`,
     `Build: <code>${BUILD_ID}</code>`,
     `Pool: ${esc(String(pair?.dexId || "unknown"))} / <code>${esc(poolLabel)}</code>`,
     `Score: <b>${r.score}/9</b>`,
@@ -2212,7 +2190,6 @@ function formatAlert(call, pair, r) {
     `1h buys/sells: ${r.buys}/${r.sells}`,
     `Why: ${esc(r.reasons.join(", "))}`,
   ];
-  lines.push(...sellingPressureDiagnostic(r, first));
   if (first) {
     lines.push(
       `Market recheck: market cap ${usd(num(first.marketCap))} → ${usd(r.marketCap)}; liquidity ${usd(num(first.liquidity))} → ${usd(r.liquidity)}`,
