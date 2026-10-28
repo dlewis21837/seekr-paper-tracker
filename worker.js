@@ -2154,6 +2154,42 @@ function scorePair(call, pair, chainName = "Solana") {
   return { score, marketCap, liquidity, volumeH1, changeM5, changeH1, buys, sells, ageMinutes, reasons };
 }
 
+// Transaction counts are not buy/sell dollar flow. Report them honestly.
+// This diagnostic uses the existing market confirmation snapshots and makes
+// no extra API requests, preserving the scanner's provider budget.
+function sellingPressureDiagnostic(review, first) {
+  const buys = num(review.buys);
+  const sells = num(review.sells);
+  const ratio = buys / Math.max(1, sells);
+  const lines = [
+    `Selling pressure (1h tx count): ${buys} buys / ${sells} sells; ratio ${ratio.toFixed(2)}x`,
+  ];
+  if (!first) {
+    lines.push("Absorption: unverified (no comparable earlier snapshot)");
+    return lines;
+  }
+  const oldLiquidity = num(first.liquidity);
+  const newLiquidity = num(review.liquidity);
+  const oldCap = num(first.marketCap);
+  const newCap = num(review.marketCap);
+  if (oldLiquidity <= 0 || oldCap <= 0 || newLiquidity <= 0 || newCap <= 0) {
+    lines.push("Absorption: unverified (missing comparable price/liquidity data)");
+    return lines;
+  }
+  const capChange = (newCap / oldCap - 1) * 100;
+  const liqChange = (newLiquidity / oldLiquidity - 1) * 100;
+  const oldRatio = num(first.buys) / Math.max(1, num(first.sells));
+  lines.push(`Recheck: cap ${capChange >= 0 ? "+" : ""}${capChange.toFixed(1)}%; liquidity ${liqChange >= 0 ? "+" : ""}${liqChange.toFixed(1)}%; 1h tx ratio ${oldRatio.toFixed(2)}x → ${ratio.toFixed(2)}x`);
+  if (sells > buys || capChange < -8 || liqChange < -15) {
+    lines.push("SELLING WARNING: pressure or price/liquidity deterioration; avoid assuming support");
+  } else if (capChange >= 0 && liqChange >= -5 && ratio >= 1.2) {
+    lines.push("BUY SUPPORT OBSERVED: positive recheck; sell-shock absorption NOT yet proven");
+  } else {
+    lines.push("Absorption: inconclusive; no verified sell shock and recovery");
+  }
+  return lines;
+}
+
 function formatAlert(call, pair, r) {
   const chainPath = call.source === "ROBINHOOD" ? "robinhood" : call.source === "BNB" ? "bsc" : "solana";
   const link = pair?.url || `https://dexscreener.com/${chainPath}/${call.contract}`;
@@ -2176,6 +2212,7 @@ function formatAlert(call, pair, r) {
     `1h buys/sells: ${r.buys}/${r.sells}`,
     `Why: ${esc(r.reasons.join(", "))}`,
   ];
+  lines.push(...sellingPressureDiagnostic(r, first));
   if (first) {
     lines.push(
       `Market recheck: market cap ${usd(num(first.marketCap))} → ${usd(r.marketCap)}; liquidity ${usd(num(first.liquidity))} → ${usd(r.liquidity)}`,
